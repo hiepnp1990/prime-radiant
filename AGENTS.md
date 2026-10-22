@@ -9,5 +9,6 @@ Anyone can read everything in this repository: files, commit messages, commit au
 - Author commits with the owner's GitHub noreply address, `<id>+<login>@users.noreply.github.com`. Don't add an `Execution-Host` trailer or any other trailer that names a machine.
 - Name branches by type and task, such as `docs/<task>` or `feat/<task>`. Don't put a machine name or a hostname in a branch name.
 - Before every push, search the diff and the commit messages for personal or machine-specific details.
+- Merge a pull request by fast-forwarding `main` to a single commit that uses the noreply address. If the branch has more than one commit, squash it locally first. Don't merge with GitHub's merge buttons or with `gh pr merge`. Both write the account's primary email into the merge commit, and GitHub rejects the noreply address as the merge author.
 
 A leak that reaches a pull request can't be removed by rewriting history. GitHub keeps the commits of every pull request even after a force-push.

@@ -52,7 +52,7 @@ Query also reads old sessions from the cold archive. The diagram leaves out that
 
 Intake accepts two kinds of write. An append sends the bytes after an offset that the hub confirmed. A snapshot sends a whole conversation with a checksum, and intake stores it only if the checksum is new.
 
-Every session has one address, `<origin>/<source>/<native-id>`. The origin is a machine ID for a local session and an account for a web chat. The index maps other IDs to that address, such as a T3 Code thread ID or a Claude desktop `local_` ID.
+Every session is identified by its source and its native ID, such as `claude-code/<uuid>`. The origin where the session ran, a machine or a web account, is an attribute. The index maps other IDs to the session, such as a T3 Code thread ID or a Claude desktop `local_` ID. [Decision 0002](0002-data-model.md) defines the records.
 
 ### Machines and connections
 

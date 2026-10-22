@@ -11,6 +11,7 @@ Prime Radiant is in design. There is no code yet.
 ## Design decisions
 
 - [0001. Central session store on an always-on hub](docs/decisions/0001-central-session-store.md)
+- [0002. Data model](docs/decisions/0002-data-model.md)
 
 ## License
 

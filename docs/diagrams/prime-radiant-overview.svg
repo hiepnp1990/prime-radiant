@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="650" viewBox="0 0 680 650" role="img">
+<title>Inside Prime Radiant</title>
+<desc>Chat apps and coding agents feed the collectors, and coding agents ask questions through access. Collectors and access run on every machine. The hub on the always-on machine runs intake, indexer, query, and archiver. Storage holds the hot store and index on the hub and the cold archive in the cloud.</desc>
+<style>
+svg { --bg:#FFFFFF; --line:#5F5E5A; --text:#2C2C2A; --muted:#5F5E5A; --box-f:#FFFFFF; --box-s:#B4B2A9;
+  --blue-f:#E6F1FB; --blue-s:#185FA5; --blue-t:#0C447C; --teal-f:#E1F5EE; --teal-s:#0F6E56; --teal-t:#085041;
+  --purple-f:#EEEDFE; --purple-s:#534AB7; --purple-t:#3C3489; --amber-f:#FAEEDA; --amber-s:#854F0B; --amber-t:#633806; }
+@media (prefers-color-scheme: dark) {
+  svg { --bg:#0D1117; --line:#B4B2A9; --text:#F1EFE8; --muted:#B4B2A9; --box-f:#2C2C2A; --box-s:#5F5E5A;
+    --blue-f:#0C447C; --blue-s:#85B7EB; --blue-t:#B5D4F4; --teal-f:#085041; --teal-s:#5DCAA5; --teal-t:#9FE1CB;
+    --purple-f:#3C3489; --purple-s:#AFA9EC; --purple-t:#CECBF6; --amber-f:#633806; --amber-s:#EF9F27; --amber-t:#FAC775; }
+}
+.bg { fill:var(--bg); }
+.th { font:500 14px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill:var(--text); }
+.ts { font:400 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill:var(--muted); }
+.box { fill:var(--box-f); stroke:var(--box-s); stroke-width:1; }
+.later { stroke-dasharray:4 3; }
+.arr { stroke:var(--line); stroke-width:1.5; fill:none; }
+.head { stroke:var(--line); fill:none; stroke-width:1.5; stroke-linecap:round; stroke-linejoin:round; }
+.c-blue > rect { fill:var(--blue-f); stroke:var(--blue-s); stroke-width:1; } .c-blue > .th { fill:var(--blue-t); }
+.c-teal > rect { fill:var(--teal-f); stroke:var(--teal-s); stroke-width:1; } .c-teal > .th { fill:var(--teal-t); } .c-teal > .ts { fill:var(--teal-s); }
+.c-purple > rect { fill:var(--purple-f); stroke:var(--purple-s); stroke-width:1; } .c-purple > .th { fill:var(--purple-t); } .c-purple > .ts { fill:var(--purple-s); }
+.c-amber > rect { fill:var(--amber-f); stroke:var(--amber-s); stroke-width:1; } .c-amber > .th { fill:var(--amber-t); } .c-amber > .ts { fill:var(--amber-s); }
+</style>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path class="head" d="M2 1L8 5L2 9"/></marker></defs>
+<rect class="bg" width="680" height="650" rx="12"/>
+<rect class="box" x="95" y="20" width="180" height="56" rx="8"/>
+<text class="th" x="185" y="39" text-anchor="middle" dominant-baseline="central">Chat apps</text>
+<text class="ts" x="185" y="58" text-anchor="middle" dominant-baseline="central">Web, phone, desktop</text>
+<rect class="box" x="405" y="20" width="180" height="56" rx="8"/>
+<text class="th" x="495" y="39" text-anchor="middle" dominant-baseline="central">Coding agents</text>
+<text class="ts" x="495" y="58" text-anchor="middle" dominant-baseline="central">Any harness</text>
+<g class="c-blue"><rect x="20" y="110" width="640" height="520" rx="20"/><text class="th" x="40" y="136">Prime Radiant</text></g>
+<line class="arr" x1="185" y1="76" x2="185" y2="158" marker-end="url(#arrow)"/>
+<line class="arr" x1="430" y1="76" x2="262" y2="158" marker-end="url(#arrow)"/>
+<line class="arr" x1="495" y1="76" x2="495" y2="158" marker-end="url(#arrow)"/>
+<g class="c-teal"><rect x="40" y="160" width="290" height="170" rx="12"/><text class="th" x="60" y="184">Collectors</text><text class="ts" x="60" y="202">On every machine</text></g>
+<rect class="box" x="60" y="214" width="250" height="28" rx="4"/>
+<text class="ts" x="185" y="228" text-anchor="middle" dominant-baseline="central">Transcript tailing</text>
+<rect class="box" x="60" y="250" width="250" height="28" rx="4"/>
+<text class="ts" x="185" y="264" text-anchor="middle" dominant-baseline="central">Web chat extension and spool</text>
+<rect class="box" x="60" y="286" width="250" height="28" rx="4"/>
+<text class="ts" x="185" y="300" text-anchor="middle" dominant-baseline="central">Account export import, on the hub</text>
+<g class="c-teal"><rect x="350" y="160" width="290" height="170" rx="12"/><text class="th" x="370" y="184">Access</text><text class="ts" x="370" y="202">On every machine</text></g>
+<rect class="box" x="370" y="214" width="250" height="28" rx="4"/>
+<text class="ts" x="495" y="228" text-anchor="middle" dominant-baseline="central">Session CLI and skill (MVP)</text>
+<rect class="box later" x="370" y="250" width="250" height="28" rx="4"/>
+<text class="ts" x="495" y="264" text-anchor="middle" dominant-baseline="central">MCP server (later)</text>
+<rect class="box later" x="370" y="286" width="250" height="28" rx="4"/>
+<text class="ts" x="495" y="300" text-anchor="middle" dominant-baseline="central">Prompt hook, T3 picker (later)</text>
+<line class="arr" x1="185" y1="330" x2="185" y2="358" marker-end="url(#arrow)"/>
+<text class="ts" x="195" y="348">segments</text>
+<line class="arr" x1="480" y1="330" x2="480" y2="358" marker-end="url(#arrow)"/>
+<line class="arr" x1="510" y1="358" x2="510" y2="332" marker-end="url(#arrow)"/>
+<text class="ts" x="520" y="348">questions, answers</text>
+<g class="c-purple"><rect x="40" y="360" width="600" height="110" rx="12"/><text class="th" x="60" y="384">Hub</text><text class="ts" x="60" y="402">On the always-on machine</text></g>
+<rect class="box" x="60" y="420" width="125" height="32" rx="4"/>
+<text class="ts" x="122" y="436" text-anchor="middle" dominant-baseline="central">Intake</text>
+<rect class="box" x="205" y="420" width="125" height="32" rx="4"/>
+<text class="ts" x="267" y="436" text-anchor="middle" dominant-baseline="central">Indexer</text>
+<rect class="box" x="350" y="420" width="125" height="32" rx="4"/>
+<text class="ts" x="412" y="436" text-anchor="middle" dominant-baseline="central">Query</text>
+<rect class="box" x="495" y="420" width="125" height="32" rx="4"/>
+<text class="ts" x="557" y="436" text-anchor="middle" dominant-baseline="central">Archiver</text>
+<line class="arr" x1="320" y1="470" x2="320" y2="498" marker-end="url(#arrow)"/>
+<line class="arr" x1="360" y1="498" x2="360" y2="472" marker-end="url(#arrow)"/>
+<text class="ts" x="370" y="488">write, read</text>
+<g class="c-amber"><rect x="40" y="500" width="600" height="110" rx="12"/><text class="th" x="60" y="524">Storage</text><text class="ts" x="60" y="542">Hot on the hub, cold in the cloud</text></g>
+<rect class="box" x="60" y="560" width="170" height="32" rx="4"/>
+<text class="ts" x="145" y="576" text-anchor="middle" dominant-baseline="central">Hot store</text>
+<rect class="box" x="245" y="560" width="170" height="32" rx="4"/>
+<text class="ts" x="330" y="576" text-anchor="middle" dominant-baseline="central">Index</text>
+<rect class="box" x="430" y="560" width="190" height="32" rx="4"/>
+<text class="ts" x="525" y="576" text-anchor="middle" dominant-baseline="central">Cold archive (cloud)</text>
+</svg>

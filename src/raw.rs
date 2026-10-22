@@ -21,18 +21,21 @@ pub enum WriteMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Source {
     ClaudeCode,
+    Codex,
 }
 
 impl Source {
     pub fn as_str(self) -> &'static str {
         match self {
             Source::ClaudeCode => "claude-code",
+            Source::Codex => "codex",
         }
     }
 
     fn parse(name: &str) -> Option<Self> {
         match name {
             "claude-code" => Some(Source::ClaudeCode),
+            "codex" => Some(Source::Codex),
             _ => None,
         }
     }

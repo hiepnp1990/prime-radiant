@@ -396,3 +396,38 @@ fn stats_has_the_documented_shape_and_a_second_import_keeps_it() {
     setup.import();
     assert_eq!(setup.stats(), stats, "a second import changes nothing");
 }
+
+#[test]
+fn import_reads_codex_beside_claude_code_and_needs_a_source() {
+    const CODEX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/codex");
+    const CODEX_ID: &str = "5f0c2a9e-7d41-4b8a-9e36-1a2b3c4d5e6f";
+    let setup = Setup::new();
+    let data = path(&setup.data);
+    run(&[
+        "import",
+        "--data",
+        data,
+        "--origin",
+        "example-origin",
+        "--claude-code",
+        path(&setup.root),
+        "--codex",
+        CODEX,
+    ]);
+    for (query, expected) in [
+        (CODEX_ID.to_owned(), format!("codex/{CODEX_ID}")),
+        (SESSION_ID.to_owned(), MAIN_KEY.to_owned()),
+    ] {
+        assert_eq!(
+            setup.find_keys(&query).first(),
+            Some(&expected),
+            "{query} finds its session"
+        );
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_prime-radiant"))
+        .args(["import", "--data", data, "--origin", "example-origin"])
+        .output()
+        .expect("the built binary runs");
+    assert!(!output.status.success(), "import without a source fails");
+}

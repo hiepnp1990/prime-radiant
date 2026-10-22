@@ -6,11 +6,11 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    Alias, AliasKind, Artifact, ArtifactKind, Facts, Identity, Line, Lineage, Media, Message,
-    Parser, Role, Timestamp,
+    Alias, AliasKind, Artifact, ArtifactKind, Contents, Facts, Identity, Line, Lineage, Media,
+    Message, Parser, Role, Timestamp,
 };
 use crate::raw::Sha256;
-use crate::redact::{self, Redacted};
+use crate::redact;
 
 const TOOL_USE_CHARS: usize = 500;
 const TOOL_RESULT_CHARS: usize = 2000;
@@ -70,19 +70,19 @@ impl Parser for ClaudeCode {
                 title: line.custom_title.clone().or_else(|| line.ai_title.clone()),
                 project: line.cwd.clone(),
                 started: line.timestamp.as_deref().and_then(Timestamp::parse_utc),
+                ..Facts::default()
             }
         };
         let message = line.uuid.clone().map(|id| message(id, line));
         Line { message, facts }
     }
 
-    fn version(&self, bytes: &[u8]) -> Facts {
+    fn version(&self, bytes: &[u8]) -> Contents {
         let file: MetadataFile = serde_json::from_slice(bytes).unwrap_or_default();
-        Facts {
+        Contents::Facts(Facts {
             title: file.custom_title.or(file.description),
-            project: None,
-            started: None,
-        }
+            ..Facts::default()
+        })
     }
 }
 
@@ -272,10 +272,11 @@ impl Found {
         }
         self.pull_requests(text);
         let clean = redact::secrets(text);
-        self.pieces.push(match limit {
-            Some(limit) => cut(&clean, limit),
-            None => clean.into_string(),
-        });
+        let clean = match limit {
+            Some(limit) => clean.cut(limit),
+            None => clean,
+        };
+        self.pieces.push(clean.into_string());
     }
 
     fn tool_use(&mut self, name: &str, input: &Value) {
@@ -286,7 +287,7 @@ impl Found {
         }
         let text = redact::tool_call(name, input);
         self.pull_requests(text.as_str());
-        self.pieces.push(cut(&text, TOOL_USE_CHARS));
+        self.pieces.push(text.cut(TOOL_USE_CHARS).into_string());
     }
 
     fn tool_result(&mut self, content: Option<&Content>) {
@@ -341,13 +342,5 @@ impl Found {
         if !self.artifacts.contains(&artifact) {
             self.artifacts.push(artifact);
         }
-    }
-}
-
-fn cut(text: &Redacted, chars: usize) -> String {
-    let text = text.as_str();
-    match text.char_indices().nth(chars) {
-        Some((end, _)) => text[..end].to_owned(),
-        None => text.to_owned(),
     }
 }

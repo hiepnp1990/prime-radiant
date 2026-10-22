@@ -1,4 +1,5 @@
 pub mod claude_code;
+pub mod codex;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -14,15 +15,25 @@ pub trait Parser {
     /// The session a stream belongs to, or `None` for a stream the parser does not read.
     /// `first_line` is the first complete line of an append stream, without its newline.
     fn session(&self, locator: &str, first_line: Option<&[u8]>) -> Option<Identity>;
-    /// One complete line of an append stream of `session`, without its newline.
+    /// One complete line of a stream of `session`, without its newline.
     fn line(&self, session: &Identity, line: &[u8]) -> Line;
     /// The latest version of a replace stream.
-    fn version(&self, bytes: &[u8]) -> Facts;
+    fn version(&self, bytes: &[u8]) -> Contents;
+}
+
+/// What a replace stream's version holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Contents {
+    /// A document of session attributes, such as a title file.
+    Facts(Facts),
+    /// A whole transcript as JSONL, which the indexer reads line by line.
+    Lines(Vec<u8>),
 }
 
 pub fn parser(source: Source) -> &'static dyn Parser {
     match source {
         Source::ClaudeCode => &claude_code::ClaudeCode,
+        Source::Codex => &codex::Codex,
     }
 }
 
@@ -60,13 +71,29 @@ impl AliasKind {
     }
 }
 
-/// Session attributes found in a stream. A title replaces the one before it, and the first project wins.
+/// Session attributes found in a stream. A title replaces the one before it, and every other fact keeps its first value.
 /// The first timestamp marks when the session started, which decides who owns history that several sessions hold.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Facts {
     pub title: Option<String>,
     pub project: Option<String>,
     pub started: Option<Timestamp>,
+    /// The title to use while the session has no `title`.
+    pub fallback_title: Option<String>,
+    /// Replaces the identity's lineage, but only in the batch of lines that creates the session.
+    pub lineage: Option<Lineage>,
+}
+
+impl Facts {
+    fn then(self, later: Facts) -> Facts {
+        Facts {
+            title: later.title.or(self.title),
+            project: self.project.or(later.project),
+            started: self.started.or(later.started),
+            fallback_title: self.fallback_title.or(later.fallback_title),
+            lineage: self.lineage.or(later.lineage),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -261,6 +288,17 @@ pub struct SyncSummary {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MessageRef {
+    Log(RawRef),
+    Version {
+        stream: StreamId,
+        sha256: Sha256,
+        decoded_start: u64,
+        decoded_end: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Indexed {
     Append {
         generation: u64,
@@ -303,12 +341,14 @@ CREATE TABLE IF NOT EXISTS messages (
     at INTEGER,
     searchable_text TEXT NOT NULL,
     raw_stream INTEGER NOT NULL,
-    raw_generation INTEGER NOT NULL,
+    raw_generation INTEGER,
+    raw_version TEXT,
     raw_start INTEGER NOT NULL,
     raw_end INTEGER NOT NULL,
     copied_from TEXT REFERENCES sessions (key),
     UNIQUE (session_key, message_id),
-    UNIQUE (session_key, position)
+    UNIQUE (session_key, position),
+    CHECK ((raw_generation IS NULL) <> (raw_version IS NULL))
 );
 CREATE INDEX IF NOT EXISTS messages_by_stream ON messages (raw_stream);
 CREATE INDEX IF NOT EXISTS messages_by_id ON messages (message_id);
@@ -499,8 +539,16 @@ impl Indexer {
             return Ok(None);
         };
 
+        let (facts, messages) = read_lines(parser, &identity, &bytes[..complete], |at, len| {
+            MessageRef::Log(RawRef {
+                stream: stream.id,
+                generation,
+                start: start + at,
+                end: start + at + len,
+            })
+        });
         let tx = self.db.transaction()?;
-        let key = ensure_session(&tx, stream, &identity)?;
+        let key = ensure_session(&tx, stream, &identity, &facts)?;
         let mut touched: Vec<String> = Vec::new();
         if restart {
             let mut delete =
@@ -514,53 +562,16 @@ impl Indexer {
                 [key.as_str()],
             )?;
         }
-        let mut position: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(position) + 1, 0) FROM messages WHERE session_key = ?1",
-            [key.as_str()],
-            |row| row.get(0),
-        )?;
-        let mut facts = Facts::default();
-        let mut inserted = Vec::new();
-        let mut line_start = start;
-        for line in bytes[..complete].split_inclusive(|b| *b == b'\n') {
-            let raw = RawRef {
-                stream: stream.id,
-                generation,
-                start: line_start,
-                end: line_start + line.len() as u64 - 1,
-            };
-            line_start += line.len() as u64;
-            let parsed = parser.line(&identity, &line[..line.len() - 1]);
-            facts.title = parsed.facts.title.or(facts.title);
-            facts.project = facts.project.or(parsed.facts.project);
-            facts.started = facts.started.or(parsed.facts.started);
-            if let Some(message) = parsed.message
-                && insert_if_new(&tx, &key, position, &message, &raw)?
-            {
-                position += 1;
-                inserted.push(message.id);
-            }
-        }
-        let added = inserted.len();
-        if apply_facts(&tx, &key, &facts)? {
-            let mut all = tx.prepare("SELECT message_id FROM messages WHERE session_key = ?1")?;
-            inserted = all
-                .query_map([key.as_str()], |row| row.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-        }
-        touched.extend(inserted);
-        attribute_copies(&tx, stream.key.source, &key, &touched)?;
-        tx.execute(
-            "UPDATE sessions SET (last_activity, message_count) =
-                (SELECT MAX(at), COUNT(*) FROM messages WHERE session_key = ?1)
-             WHERE key = ?1",
-            [key.as_str()],
-        )?;
+        let added = index_lines(&tx, stream.key.source, &key, &facts, &messages, touched)?;
         tx.execute(
             "INSERT INTO progress (stream, generation, indexed_offset) VALUES (?1, ?2, ?3)
              ON CONFLICT (stream) DO UPDATE SET generation = excluded.generation,
                 indexed_offset = excluded.indexed_offset, indexed_checksum = NULL",
-            params![stream.id.0, generation as i64, line_start as i64],
+            params![
+                stream.id.0,
+                generation as i64,
+                (start + complete as u64) as i64
+            ],
         )?;
         tx.commit()?;
         Ok(Some(added))
@@ -583,10 +594,20 @@ impl Indexer {
         let Some(identity) = parser.session(&stream.key.locator, None) else {
             return Ok(None);
         };
-        let facts = parser.version(&self.raw.version(latest_checksum)?);
+        let (facts, messages) = match parser.version(&self.raw.version(latest_checksum)?) {
+            Contents::Facts(facts) => (facts, Vec::new()),
+            Contents::Lines(bytes) => {
+                read_lines(parser, &identity, &bytes, |at, len| MessageRef::Version {
+                    stream: stream.id,
+                    sha256: latest_checksum,
+                    decoded_start: at,
+                    decoded_end: at + len,
+                })
+            }
+        };
         let tx = self.db.transaction()?;
-        let key = ensure_session(&tx, stream, &identity)?;
-        apply_facts(&tx, &key, &facts)?;
+        let key = ensure_session(&tx, stream, &identity, &facts)?;
+        let added = index_lines(&tx, stream.key.source, &key, &facts, &messages, Vec::new())?;
         tx.execute(
             "INSERT INTO progress (stream, indexed_checksum) VALUES (?1, ?2)
              ON CONFLICT (stream) DO UPDATE SET generation = NULL, indexed_offset = NULL,
@@ -594,7 +615,7 @@ impl Indexer {
             params![stream.id.0, latest_checksum.to_hex()],
         )?;
         tx.commit()?;
-        Ok(Some(0))
+        Ok(Some(added))
     }
 
     /// The bytes before the first newline of the stream's current generation, or all of them if it has none yet.
@@ -629,10 +650,76 @@ pub fn open_db(dir: &Path) -> Result<Connection> {
     Ok(db)
 }
 
-fn ensure_session(tx: &Transaction, stream: &Stream, identity: &Identity) -> Result<SessionKey> {
+fn read_lines(
+    parser: &dyn Parser,
+    session: &Identity,
+    bytes: &[u8],
+    place: impl Fn(u64, u64) -> MessageRef,
+) -> (Facts, Vec<(Message, MessageRef)>) {
+    let mut facts = Facts::default();
+    let mut messages = Vec::new();
+    let mut at = 0;
+    for line in bytes.split(|b| *b == b'\n') {
+        let len = line.len() as u64;
+        if len > 0 {
+            let parsed = parser.line(session, line);
+            facts = facts.then(parsed.facts);
+            if let Some(message) = parsed.message {
+                messages.push((message, place(at, len)));
+            }
+        }
+        at += len + 1;
+    }
+    (facts, messages)
+}
+
+fn index_lines(
+    tx: &Transaction,
+    source: Source,
+    key: &SessionKey,
+    facts: &Facts,
+    messages: &[(Message, MessageRef)],
+    mut touched: Vec<String>,
+) -> Result<usize> {
+    let mut position: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(position) + 1, 0) FROM messages WHERE session_key = ?1",
+        [key.as_str()],
+        |row| row.get(0),
+    )?;
+    let mut inserted = Vec::new();
+    for (message, raw) in messages {
+        if insert_if_new(tx, key, position, message, raw)? {
+            position += 1;
+            inserted.push(message.id.clone());
+        }
+    }
+    let added = inserted.len();
+    if apply_facts(tx, key, facts)? {
+        let mut all = tx.prepare("SELECT message_id FROM messages WHERE session_key = ?1")?;
+        inserted = all
+            .query_map([key.as_str()], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+    }
+    touched.extend(inserted);
+    attribute_copies(tx, source, key, &touched)?;
+    tx.execute(
+        "UPDATE sessions SET (last_activity, message_count) =
+            (SELECT MAX(at), COUNT(*) FROM messages WHERE session_key = ?1)
+         WHERE key = ?1",
+        [key.as_str()],
+    )?;
+    Ok(added)
+}
+
+fn ensure_session(
+    tx: &Transaction,
+    stream: &Stream,
+    identity: &Identity,
+    facts: &Facts,
+) -> Result<SessionKey> {
     let source = stream.key.source;
     let key = SessionKey::new(source, &identity.native_id);
-    let (kind, parent) = match &identity.lineage {
+    let (kind, parent) = match facts.lineage.as_ref().unwrap_or(&identity.lineage) {
         Lineage::Main => ("main", None),
         Lineage::Subagent { parent_native_id } => {
             ("subagent", Some(SessionKey::new(source, parent_native_id)))
@@ -659,11 +746,17 @@ fn ensure_session(tx: &Transaction, stream: &Stream, identity: &Identity) -> Res
     Ok(key)
 }
 
-/// Records `facts` on the session. Returns whether this set the session's start, which can change who owns its messages.
+/// Records `facts` on the session. Returns whether this moved the session's start, which can change who owns its messages.
 fn apply_facts(tx: &Transaction, key: &SessionKey, facts: &Facts) -> Result<bool> {
     if let Some(title) = &facts.title {
         tx.execute(
             "UPDATE sessions SET title = ?2 WHERE key = ?1 AND title IS NOT ?2",
+            params![key.as_str(), title],
+        )?;
+    }
+    if let Some(title) = &facts.fallback_title {
+        tx.execute(
+            "UPDATE sessions SET title = ?2 WHERE key = ?1 AND title IS NULL",
             params![key.as_str(), title],
         )?;
     }
@@ -676,7 +769,8 @@ fn apply_facts(tx: &Transaction, key: &SessionKey, facts: &Facts) -> Result<bool
     let started = match facts.started {
         Some(at) => {
             tx.execute(
-                "UPDATE sessions SET started_at = ?2 WHERE key = ?1 AND started_at IS NULL",
+                "UPDATE sessions SET started_at = ?2
+                 WHERE key = ?1 AND (started_at IS NULL OR started_at > ?2)",
                 params![key.as_str(), at.0],
             )? > 0
         }
@@ -744,13 +838,34 @@ fn insert_if_new(
     key: &SessionKey,
     position: i64,
     message: &Message,
-    raw: &RawRef,
+    raw: &MessageRef,
 ) -> Result<bool> {
+    let (stream, generation, version, start, end) = match *raw {
+        MessageRef::Log(raw) => (
+            raw.stream,
+            Some(raw.generation as i64),
+            None,
+            raw.start,
+            raw.end,
+        ),
+        MessageRef::Version {
+            stream,
+            sha256,
+            decoded_start,
+            decoded_end,
+        } => (
+            stream,
+            None,
+            Some(sha256.to_hex()),
+            decoded_start,
+            decoded_end,
+        ),
+    };
     let id: Option<i64> = tx
         .query_row(
             "INSERT INTO messages (session_key, message_id, parent_id, position, role, at,
-                searchable_text, raw_stream, raw_generation, raw_start, raw_end)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                searchable_text, raw_stream, raw_generation, raw_version, raw_start, raw_end)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT (session_key, message_id) DO NOTHING
              RETURNING id",
             params![
@@ -761,10 +876,11 @@ fn insert_if_new(
                 message.role.as_str(),
                 message.at.map(|at| at.0),
                 message.searchable_text,
-                raw.stream.0,
-                raw.generation as i64,
-                raw.start as i64,
-                raw.end as i64,
+                stream.0,
+                generation,
+                version,
+                start as i64,
+                end as i64,
             ],
             |row| row.get(0),
         )

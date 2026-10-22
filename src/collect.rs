@@ -1,4 +1,5 @@
 pub mod claude_code;
+pub mod codex;
 
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -171,4 +172,8 @@ pub fn import(
         }
     }
     Ok(summary)
+}
+
+pub fn import_codex(root: &Path, origin: &str, store: &mut Store) -> Result<ImportSummary> {
+    import(&codex::scan(root)?, origin, Source::Codex, store)
 }

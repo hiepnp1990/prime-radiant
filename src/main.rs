@@ -3,10 +3,10 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
-use prime_radiant::collect::import_claude_code;
+use prime_radiant::collect::{import_claude_code, import_codex};
 use prime_radiant::index::{Indexer, Timestamp};
 use prime_radiant::query::{Brief, Hit, Query, Stats};
-use prime_radiant::raw::Store;
+use prime_radiant::raw::{Source, Store};
 use serde::Serialize;
 
 const WIDTH: usize = 100;
@@ -25,7 +25,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Import Claude Code transcripts into the raw layer, then index them.
+    /// Import Claude Code and Codex transcripts into the raw layer, then index them.
+    #[command(group(clap::ArgGroup::new("sources").required(true).multiple(true)))]
     Import {
         #[arg(long)]
         data: PathBuf,
@@ -33,8 +34,11 @@ enum Command {
         #[arg(long)]
         origin: String,
         /// A Claude Code projects folder, such as ~/.claude/projects.
-        #[arg(long = "claude-code")]
-        claude_code: PathBuf,
+        #[arg(long = "claude-code", group = "sources")]
+        claude_code: Vec<PathBuf>,
+        /// A Codex home folder, such as ~/.codex.
+        #[arg(long, group = "sources")]
+        codex: Vec<PathBuf>,
     },
     /// Count what the store holds, and list every stream and session.
     Stats {
@@ -81,7 +85,8 @@ fn run(command: Command) -> prime_radiant::Result<()> {
             data,
             origin,
             claude_code,
-        } => import(&data, &origin, &claude_code),
+            codex,
+        } => import(&data, &origin, &claude_code, &codex),
         Command::Stats { data, json } => {
             let stats = Query::open(&data, now())?.stats()?;
             if json {
@@ -121,25 +126,41 @@ fn run(command: Command) -> prime_radiant::Result<()> {
     }
 }
 
-fn import(data: &Path, origin: &str, root: &Path) -> prime_radiant::Result<()> {
-    let summary = import_claude_code(root, origin, &mut Store::open(data)?)?;
+fn import(
+    data: &Path,
+    origin: &str,
+    claude_code: &[PathBuf],
+    codex: &[PathBuf],
+) -> prime_radiant::Result<()> {
+    let roots = claude_code
+        .iter()
+        .map(|root| (Source::ClaudeCode, root))
+        .chain(codex.iter().map(|root| (Source::Codex, root)));
+    let mut store = Store::open(data)?;
+    for (source, root) in roots {
+        let summary = match source {
+            Source::ClaudeCode => import_claude_code(root, origin, &mut store)?,
+            Source::Codex => import_codex(root, origin, &mut store)?,
+        };
+        println!(
+            "{}: scanned {} files: {} vanished before they were read, {} bytes appended, {} versions stored, {} generations started, {} writes rejected",
+            source.as_str(),
+            summary.files_scanned,
+            summary.files_vanished,
+            summary.bytes_appended,
+            summary.versions_stored,
+            summary.generations_started,
+            summary.rejected.len(),
+        );
+        for (key, rejection) in summary.rejected.iter().take(5) {
+            eprintln!("rejected {}: {rejection:?}", key.locator);
+        }
+    }
     let synced = Indexer::open(data)?.sync()?;
-    println!(
-        "scanned {} files: {} vanished before they were read, {} bytes appended, {} versions stored, {} generations started, {} writes rejected",
-        summary.files_scanned,
-        summary.files_vanished,
-        summary.bytes_appended,
-        summary.versions_stored,
-        summary.generations_started,
-        summary.rejected.len(),
-    );
     println!(
         "indexed {} messages from {} streams",
         synced.messages_indexed, synced.streams_synced
     );
-    for (key, rejection) in summary.rejected.iter().take(5) {
-        eprintln!("rejected {}: {rejection:?}", key.locator);
-    }
     Ok(())
 }
 

@@ -44,6 +44,13 @@ impl Redacted {
     pub fn into_string(self) -> String {
         self.0
     }
+
+    pub fn cut(mut self, chars: usize) -> Redacted {
+        if let Some((end, _)) = self.0.char_indices().nth(chars) {
+            self.0.truncate(end);
+        }
+        self
+    }
 }
 
 /// Replaces credentials that commonly leak into transcripts with `[redacted]`.

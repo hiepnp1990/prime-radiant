@@ -1,5 +1,7 @@
 pub mod collect;
+pub mod index;
 pub mod raw;
+pub mod redact;
 
 use std::fmt;
 use std::io;

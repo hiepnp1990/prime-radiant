@@ -5,7 +5,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 use sha2::Digest;
 
 use crate::{Error, Result};
@@ -85,6 +85,26 @@ pub struct StreamKey {
     pub source: Source,
     /// The path relative to the source root, with `/` separators.
     pub locator: String,
+}
+
+/// The raw layer's row ID for a stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StreamId(pub i64);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stream {
+    pub id: StreamId,
+    pub key: StreamKey,
+    pub state: StreamState,
+}
+
+/// Bytes `start..end` of one generation of an append stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawRef {
+    pub stream: StreamId,
+    pub generation: u64,
+    pub start: u64,
+    pub end: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -203,7 +223,7 @@ CREATE TABLE IF NOT EXISTS versions (
 );
 ";
 
-const STREAM_COLUMNS: &str = "id, source, locator, write_mode, generation, confirmed_offset, head_len, head_sha256, latest_checksum";
+const STREAM_COLUMNS: &str = "id, source, locator, write_mode, generation, confirmed_offset, head_len, head_sha256, latest_checksum, origin";
 
 struct StreamRow {
     id: i64,
@@ -215,6 +235,7 @@ struct StreamRow {
     head_len: i64,
     head_sha256: Option<String>,
     latest_checksum: Option<String>,
+    origin: String,
 }
 
 impl StreamRow {
@@ -229,6 +250,25 @@ impl StreamRow {
             head_len: row.get(6)?,
             head_sha256: row.get(7)?,
             latest_checksum: row.get(8)?,
+            origin: row.get(9)?,
+        })
+    }
+
+    fn stream(&self) -> Result<Stream> {
+        let source = Source::parse(&self.source).ok_or_else(|| {
+            Error::Corrupt(format!(
+                "stream {} has unknown source {}",
+                self.id, self.source
+            ))
+        })?;
+        Ok(Stream {
+            id: StreamId(self.id),
+            key: StreamKey {
+                origin: self.origin.clone(),
+                source,
+                locator: self.locator.clone(),
+            },
+            state: self.state()?,
         })
     }
 
@@ -305,20 +345,7 @@ impl Store {
             .query_map([origin], StreamRow::read)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows.iter()
-            .map(|row| {
-                let source = Source::parse(&row.source).ok_or_else(|| {
-                    Error::Corrupt(format!(
-                        "stream {} has unknown source {}",
-                        row.id, row.source
-                    ))
-                })?;
-                let key = StreamKey {
-                    origin: origin.to_owned(),
-                    source,
-                    locator: row.locator.clone(),
-                };
-                Ok((key, row.state()?))
-            })
+            .map(|row| row.stream().map(|stream| (stream.key, stream.state)))
             .collect()
     }
 
@@ -334,8 +361,10 @@ impl Store {
             } => Vec::new(),
             Progress::Append {
                 confirmed_offset, ..
-            } => self.read_log(id, state.generation, 0, confirmed_offset)?,
-            Progress::Replace { latest_checksum } => fs::read(self.blob_path(latest_checksum))?,
+            } => read_log(&self.dir, id, state.generation, 0, confirmed_offset)?,
+            Progress::Replace { latest_checksum } => {
+                fs::read(blob_path(&self.dir, latest_checksum))?
+            }
         };
         Ok(Some(bytes))
     }
@@ -413,11 +442,13 @@ impl Store {
                 return Ok(Applied::Rejected(Rejection::Overlap { confirmed_offset }));
             }
             let id = id.expect("a stream with confirmed bytes has a row");
-            return Ok(if self.read_log(id, generation, start, end)? == bytes {
-                Applied::AlreadyHad
-            } else {
-                Applied::Rejected(Rejection::ChecksumMismatch)
-            });
+            return Ok(
+                if read_log(&self.dir, id, generation, start, end)? == bytes {
+                    Applied::AlreadyHad
+                } else {
+                    Applied::Rejected(Rejection::ChecksumMismatch)
+                },
+            );
         }
         if bytes.is_empty() {
             return Ok(Applied::AlreadyHad);
@@ -427,7 +458,7 @@ impl Store {
             Some(id) => id,
             None => self.create_append_stream(key)?,
         };
-        let dir = self.stream_dir(id);
+        let dir = stream_dir(&self.dir, id);
         fs::create_dir_all(&dir)?;
         let mut log = OpenOptions::new()
             .read(true)
@@ -525,7 +556,7 @@ impl Store {
     }
 
     fn write_blob(&self, sha256: Sha256, bytes: &[u8]) -> Result<()> {
-        let path = self.blob_path(sha256);
+        let path = blob_path(&self.dir, sha256);
         if path.exists() {
             return Ok(());
         }
@@ -554,7 +585,7 @@ impl Store {
                     committed.query_row(params![id, generation as i64], |row| row.get(0))?;
                 let file = match OpenOptions::new()
                     .write(true)
-                    .open(self.log_path(id, generation))
+                    .open(log_path(&self.dir, id, generation))
                 {
                     Ok(file) => file,
                     Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -568,26 +599,74 @@ impl Store {
         }
         Ok(())
     }
+}
 
-    fn read_log(&self, id: i64, generation: u64, start: u64, end: u64) -> Result<Vec<u8>> {
-        let mut file = File::open(self.log_path(id, generation))?;
-        file.seek(SeekFrom::Start(start))?;
-        let mut bytes = vec![0; (end - start) as usize];
-        file.read_exact(&mut bytes)?;
-        Ok(bytes)
+/// A read-only view of the raw layer. Any number can be open beside the one `Store`.
+pub struct View {
+    dir: PathBuf,
+    db: Connection,
+}
+
+impl View {
+    pub fn open(dir: &Path) -> Result<Self> {
+        let db = Connection::open_with_flags(
+            dir.join("raw.db"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        Ok(Self {
+            dir: dir.to_owned(),
+            db,
+        })
     }
 
-    fn stream_dir(&self, id: i64) -> PathBuf {
-        self.dir.join("streams").join(id.to_string())
+    pub fn streams(&self) -> Result<Vec<Stream>> {
+        let mut query = self.db.prepare(&format!(
+            "SELECT {STREAM_COLUMNS} FROM streams ORDER BY origin, source, locator"
+        ))?;
+        let rows = query
+            .query_map([], StreamRow::read)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.iter().map(StreamRow::stream).collect()
     }
 
-    fn log_path(&self, id: i64, generation: u64) -> PathBuf {
-        self.stream_dir(id).join(format!("{generation}.log"))
+    /// Reads committed bytes only, so a reference past the committed end is an error.
+    pub fn read(&self, raw: &RawRef) -> Result<Vec<u8>> {
+        let committed: i64 = self.db.query_row(
+            "SELECT COALESCE(MAX(end_offset), 0) FROM segments WHERE stream = ?1 AND generation = ?2",
+            params![raw.stream.0, raw.generation as i64],
+            |row| row.get(0),
+        )?;
+        if raw.start > raw.end || raw.end > committed as u64 {
+            return Err(Error::Corrupt(format!(
+                "{raw:?} is outside the committed bytes of its stream"
+            )));
+        }
+        read_log(&self.dir, raw.stream.0, raw.generation, raw.start, raw.end)
     }
 
-    fn blob_path(&self, sha256: Sha256) -> PathBuf {
-        self.dir.join("blobs").join(sha256.to_hex())
+    pub fn version(&self, sha256: Sha256) -> Result<Vec<u8>> {
+        Ok(fs::read(blob_path(&self.dir, sha256))?)
     }
+}
+
+fn read_log(dir: &Path, id: i64, generation: u64, start: u64, end: u64) -> Result<Vec<u8>> {
+    let mut file = File::open(log_path(dir, id, generation))?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = vec![0; (end - start) as usize];
+    file.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn stream_dir(dir: &Path, id: i64) -> PathBuf {
+    dir.join("streams").join(id.to_string())
+}
+
+fn log_path(dir: &Path, id: i64, generation: u64) -> PathBuf {
+    stream_dir(dir, id).join(format!("{generation}.log"))
+}
+
+fn blob_path(dir: &Path, sha256: Sha256) -> PathBuf {
+    dir.join("blobs").join(sha256.to_hex())
 }
 
 fn sync_dir(dir: &Path) -> io::Result<()> {

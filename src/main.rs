@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
-use prime_radiant::collect::{import_claude_code, import_codex};
+use prime_radiant::collect::{import_claude_code, import_codex, import_t3_code};
 use prime_radiant::index::{Indexer, Timestamp};
 use prime_radiant::query::{Brief, Hit, Query, Stats};
 use prime_radiant::raw::{Source, Store};
@@ -25,7 +25,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Import Claude Code and Codex transcripts into the raw layer, then index them.
+    /// Import Claude Code, Codex, and T3 Code sessions into the raw layer, then index them.
     #[command(group(clap::ArgGroup::new("sources").required(true).multiple(true)))]
     Import {
         #[arg(long)]
@@ -39,6 +39,9 @@ enum Command {
         /// A Codex home folder, such as ~/.codex.
         #[arg(long, group = "sources")]
         codex: Vec<PathBuf>,
+        /// A T3 Code database, such as ~/.t3/userdata/statev2.sqlite. It is only read.
+        #[arg(long = "t3-code", value_name = "DATABASE", group = "sources")]
+        t3_code: Vec<PathBuf>,
     },
     /// Count what the store holds, and list every stream and session.
     Stats {
@@ -86,7 +89,15 @@ fn run(command: Command) -> prime_radiant::Result<()> {
             origin,
             claude_code,
             codex,
-        } => import(&data, &origin, &claude_code, &codex),
+            t3_code,
+        } => {
+            let sources = claude_code
+                .into_iter()
+                .map(|path| (Source::ClaudeCode, path))
+                .chain(codex.into_iter().map(|path| (Source::Codex, path)))
+                .chain(t3_code.into_iter().map(|path| (Source::T3Code, path)));
+            import(&data, &origin, sources)
+        }
         Command::Stats { data, json } => {
             let stats = Query::open(&data, now())?.stats()?;
             if json {
@@ -129,21 +140,17 @@ fn run(command: Command) -> prime_radiant::Result<()> {
 fn import(
     data: &Path,
     origin: &str,
-    claude_code: &[PathBuf],
-    codex: &[PathBuf],
+    sources: impl Iterator<Item = (Source, PathBuf)>,
 ) -> prime_radiant::Result<()> {
-    let roots = claude_code
-        .iter()
-        .map(|root| (Source::ClaudeCode, root))
-        .chain(codex.iter().map(|root| (Source::Codex, root)));
     let mut store = Store::open(data)?;
-    for (source, root) in roots {
-        let summary = match source {
-            Source::ClaudeCode => import_claude_code(root, origin, &mut store)?,
-            Source::Codex => import_codex(root, origin, &mut store)?,
+    for (source, path) in sources {
+        let (summary, unit) = match source {
+            Source::ClaudeCode => (import_claude_code(&path, origin, &mut store)?, "files"),
+            Source::Codex => (import_codex(&path, origin, &mut store)?, "files"),
+            Source::T3Code => (import_t3_code(&path, origin, &mut store)?, "threads"),
         };
         println!(
-            "{}: scanned {} files: {} vanished before they were read, {} bytes appended, {} versions stored, {} generations started, {} writes rejected",
+            "{}: scanned {} {unit}: {} vanished before they were read, {} bytes appended, {} versions stored, {} generations started, {} writes rejected",
             source.as_str(),
             summary.files_scanned,
             summary.files_vanished,
@@ -233,6 +240,14 @@ fn brief_text(brief: &Brief) -> String {
         optional_time(brief.last_activity),
         brief.state.as_str()
     ));
+    for (label, at) in [
+        ("archived", brief.archived_at),
+        ("deleted", brief.deleted_at),
+    ] {
+        if let Some(at) = at {
+            line(&format!("{label} {at}"));
+        }
+    }
     let roles: Vec<String> = brief
         .messages
         .iter()
@@ -279,6 +294,17 @@ fn brief_text(brief: &Brief) -> String {
                 "  and {} more\n",
                 body.changed_files_total - body.changed_files.len()
             );
+        }
+    }
+    for (label, keys) in [
+        ("underlying sessions", &brief.underlying_sessions),
+        ("front-end sessions", &brief.front_end_sessions),
+    ] {
+        if !keys.is_empty() {
+            out += &format!("\n{label}:\n");
+            for key in keys {
+                out += &wrap(key, "  ");
+            }
         }
     }
     if !body.subagents.is_empty() {

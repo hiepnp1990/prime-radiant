@@ -6,8 +6,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    Alias, AliasKind, Artifact, ArtifactKind, Contents, Facts, Identity, Line, Lineage, Media,
-    Message, Parser, Role, Timestamp,
+    Alias, AliasKind, Artifact, ArtifactKind, Facts, Identity, Line, Lineage, Media, Message,
+    Parser, Role, Timestamp, Version,
 };
 use crate::raw::Sha256;
 use crate::redact;
@@ -77,12 +77,15 @@ impl Parser for ClaudeCode {
         Line { message, facts }
     }
 
-    fn version(&self, bytes: &[u8]) -> Contents {
+    fn version(&self, _session: &Identity, bytes: &[u8]) -> Version {
         let file: MetadataFile = serde_json::from_slice(bytes).unwrap_or_default();
-        Contents::Facts(Facts {
-            title: file.custom_title.or(file.description),
-            ..Facts::default()
-        })
+        Version {
+            facts: Facts {
+                title: file.custom_title.or(file.description),
+                ..Facts::default()
+            },
+            ..Version::default()
+        }
     }
 }
 

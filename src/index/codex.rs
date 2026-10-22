@@ -5,7 +5,8 @@ use serde::de::{DeserializeOwned, IgnoredAny};
 use serde_json::Value;
 
 use super::{
-    Alias, AliasKind, Contents, Facts, Identity, Line, Lineage, Message, Parser, Role, Timestamp,
+    Alias, AliasKind, Facts, Identity, Line, Lineage, Message, Parser, Role, Timestamp, Version,
+    read_lines,
 };
 use crate::redact::{self, Redacted};
 
@@ -84,8 +85,13 @@ impl Parser for Codex {
         }
     }
 
-    fn version(&self, bytes: &[u8]) -> Contents {
-        Contents::Lines(decoded_prefix(bytes))
+    fn version(&self, session: &Identity, bytes: &[u8]) -> Version {
+        let (facts, messages) = read_lines(self, session, &decoded_prefix(bytes));
+        Version {
+            facts,
+            messages,
+            ..Version::default()
+        }
     }
 }
 

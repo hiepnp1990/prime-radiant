@@ -1,5 +1,6 @@
 pub mod claude_code;
 pub mod codex;
+pub mod t3_code;
 
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -117,20 +118,48 @@ fn plan_replace(
     state: Option<&StreamState>,
     writes: &mut Vec<Write>,
 ) -> io::Result<()> {
-    let bytes = fs::read(path)?;
+    writes.extend(plan_version(key, fs::read(path)?, state));
+    Ok(())
+}
+
+/// A version of a replace stream, unless the raw layer already has these bytes as its latest.
+fn plan_version(key: StreamKey, bytes: Vec<u8>, state: Option<&StreamState>) -> Option<Write> {
     let sha256 = Sha256::of(&bytes);
     let unchanged = matches!(
         state,
         Some(StreamState { progress: Progress::Replace { latest_checksum }, .. }) if *latest_checksum == sha256
     );
-    if !unchanged {
-        writes.push(Write::Version { key, sha256, bytes });
-    }
-    Ok(())
+    (!unchanged).then_some(Write::Version { key, sha256, bytes })
 }
 
 pub fn import_claude_code(root: &Path, origin: &str, store: &mut Store) -> Result<ImportSummary> {
     import(&claude_code::scan(root)?, origin, Source::ClaudeCode, store)
+}
+
+pub fn import_codex(root: &Path, origin: &str, store: &mut Store) -> Result<ImportSummary> {
+    import(&codex::scan(root)?, origin, Source::Codex, store)
+}
+
+/// Imports each thread of a T3 Code database as one replace stream. `files_scanned` counts threads.
+pub fn import_t3_code(db_path: &Path, origin: &str, store: &mut Store) -> Result<ImportSummary> {
+    let threads = t3_code::snapshots(db_path)?;
+    let states = store.state(origin)?;
+    let mut summary = ImportSummary {
+        files_scanned: threads.len(),
+        ..ImportSummary::default()
+    };
+    for thread in threads {
+        let key = StreamKey {
+            origin: origin.to_owned(),
+            source: Source::T3Code,
+            locator: thread.locator,
+        };
+        let state = states.get(&key);
+        if let Some(write) = plan_version(key, thread.bytes, state) {
+            apply(store, &write, &mut summary)?;
+        }
+    }
+    Ok(summary)
 }
 
 /// Imports the files a scan found. A file deleted since the scan is skipped and counted.
@@ -155,25 +184,24 @@ pub fn import(
             Err(error) => return Err(error.into()),
         };
         for write in writes {
-            summary.writes_planned += 1;
-            match store.apply(&write)? {
-                Applied::Appended { .. } => {
-                    if let Write::Segment { bytes, .. } = &write {
-                        summary.bytes_appended += bytes.len() as u64;
-                    }
-                }
-                Applied::VersionStored => summary.versions_stored += 1,
-                Applied::NewGenerationStarted { .. } => summary.generations_started += 1,
-                Applied::Rejected(rejection) => {
-                    summary.rejected.push((write.key().clone(), rejection))
-                }
-                Applied::AlreadyHad | Applied::VersionUnchanged => {}
-            }
+            apply(store, &write, &mut summary)?;
         }
     }
     Ok(summary)
 }
 
-pub fn import_codex(root: &Path, origin: &str, store: &mut Store) -> Result<ImportSummary> {
-    import(&codex::scan(root)?, origin, Source::Codex, store)
+fn apply(store: &mut Store, write: &Write, summary: &mut ImportSummary) -> Result<()> {
+    summary.writes_planned += 1;
+    match store.apply(write)? {
+        Applied::Appended { .. } => {
+            if let Write::Segment { bytes, .. } = write {
+                summary.bytes_appended += bytes.len() as u64;
+            }
+        }
+        Applied::VersionStored => summary.versions_stored += 1,
+        Applied::NewGenerationStarted { .. } => summary.generations_started += 1,
+        Applied::Rejected(rejection) => summary.rejected.push((write.key().clone(), rejection)),
+        Applied::AlreadyHad | Applied::VersionUnchanged => {}
+    }
+    Ok(())
 }

@@ -93,6 +93,12 @@ pub struct Brief {
     pub started: Option<Timestamp>,
     pub last_activity: Option<Timestamp>,
     pub state: State,
+    pub archived_at: Option<Timestamp>,
+    pub deleted_at: Option<Timestamp>,
+    /// Sessions that another harness ran for this one, such as the Claude Code session behind a T3 Code thread.
+    pub underlying_sessions: Vec<String>,
+    /// Sessions that name this one as an underlying session.
+    pub front_end_sessions: Vec<String>,
     /// Message counts by role, plus `total`.
     pub messages: BTreeMap<String, u64>,
     #[serde(flatten)]
@@ -207,22 +213,37 @@ impl Query {
                 )));
             }
         };
-        let (title, project, origin, parent, started, last_activity) = self.db.query_row(
-            "SELECT title, project, ran_on, parent_key, started_at, last_activity FROM sessions WHERE key = ?1",
-            [&key],
-            |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<i64>>(4)?.map(Timestamp),
-                    row.get::<_, Option<i64>>(5)?.map(Timestamp),
-                ))
-            },
-        )?;
+        let (title, project, origin, parent, started, last_activity, archived_at, deleted_at) =
+            self.db.query_row(
+                "SELECT title, project, ran_on, parent_key, started_at, last_activity, archived_at, deleted_at
+                 FROM sessions WHERE key = ?1",
+                [&key],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<i64>>(4)?.map(Timestamp),
+                        row.get::<_, Option<i64>>(5)?.map(Timestamp),
+                        row.get::<_, Option<i64>>(6)?.map(Timestamp),
+                        row.get::<_, Option<i64>>(7)?.map(Timestamp),
+                    ))
+                },
+            )?;
         let (body, freshness) = self.brief_body(&key)?;
         Ok(Brief {
+            underlying_sessions: self.strings(
+                "SELECT value FROM artifacts WHERE session_key = ?1 AND kind = 'underlying_session' ORDER BY value",
+                &key,
+            )?,
+            front_end_sessions: self.strings(
+                "SELECT session_key FROM artifacts WHERE value = ?1 AND kind = 'underlying_session'
+                 ORDER BY session_key",
+                &key,
+            )?,
+            archived_at,
+            deleted_at,
             messages: self.role_counts(&key)?,
             state: State::of(last_activity, self.now),
             key,
@@ -468,6 +489,14 @@ impl Query {
             score,
             snippet,
         })
+    }
+
+    fn strings(&self, sql: &str, key: &str) -> Result<Vec<String>> {
+        let mut query = self.db.prepare(sql)?;
+        let rows = query
+            .query_map([key], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 
     fn role_counts(&self, key: &str) -> Result<BTreeMap<String, u64>> {

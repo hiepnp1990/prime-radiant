@@ -1,8 +1,10 @@
 pub mod claude_code;
 pub mod codex;
+pub mod t3_code;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::ops::Range;
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -17,23 +19,15 @@ pub trait Parser {
     fn session(&self, locator: &str, first_line: Option<&[u8]>) -> Option<Identity>;
     /// One complete line of a stream of `session`, without its newline.
     fn line(&self, session: &Identity, line: &[u8]) -> Line;
-    /// The latest version of a replace stream.
-    fn version(&self, bytes: &[u8]) -> Contents;
-}
-
-/// What a replace stream's version holds.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Contents {
-    /// A document of session attributes, such as a title file.
-    Facts(Facts),
-    /// A whole transcript as JSONL, which the indexer reads line by line.
-    Lines(Vec<u8>),
+    /// The latest version of a replace stream of `session`.
+    fn version(&self, session: &Identity, bytes: &[u8]) -> Version;
 }
 
 pub fn parser(source: Source) -> &'static dyn Parser {
     match source {
         Source::ClaudeCode => &claude_code::ClaudeCode,
         Source::Codex => &codex::Codex,
+        Source::T3Code => &t3_code::T3Code,
     }
 }
 
@@ -96,6 +90,24 @@ impl Facts {
     }
 }
 
+/// What one version of a replace stream says. Its messages and session artifacts replace the ones its stream's previous version gave.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Version {
+    pub facts: Facts,
+    /// `None` when the stream does not track whether its session is archived or deleted.
+    pub lifecycle: Option<Lifecycle>,
+    /// Each message with its byte range in the version, after the parser decoded it, such as from zstd.
+    pub messages: Vec<(Message, Range<u64>)>,
+    /// Artifacts of the whole session, rather than of one message.
+    pub artifacts: Vec<Artifact>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Lifecycle {
+    pub archived_at: Option<Timestamp>,
+    pub deleted_at: Option<Timestamp>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Line {
     pub message: Option<Message>,
@@ -146,6 +158,8 @@ pub struct Artifact {
 pub enum ArtifactKind {
     PullRequest,
     ChangedFile,
+    /// The key of a session that another harness ran for this one, such as a Claude Code session behind a T3 Code thread.
+    UnderlyingSession,
 }
 
 impl ArtifactKind {
@@ -153,6 +167,7 @@ impl ArtifactKind {
         match self {
             ArtifactKind::PullRequest => "pull_request",
             ArtifactKind::ChangedFile => "changed_file",
+            ArtifactKind::UnderlyingSession => "underlying_session",
         }
     }
 }
@@ -324,6 +339,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_activity INTEGER,
     message_count INTEGER NOT NULL DEFAULT 0,
     own_message_count INTEGER NOT NULL DEFAULT 0,
+    archived_at INTEGER,
+    deleted_at INTEGER,
     CHECK ((kind = 'main') = (parent_key IS NULL))
 );
 CREATE INDEX IF NOT EXISTS sessions_by_activity ON sessions (last_activity);
@@ -361,12 +378,16 @@ CREATE TABLE IF NOT EXISTS aliases (
 
 CREATE TABLE IF NOT EXISTS artifacts (
     session_key TEXT NOT NULL REFERENCES sessions (key),
-    kind TEXT NOT NULL CHECK (kind IN ('pull_request', 'changed_file')),
+    kind TEXT NOT NULL CHECK (kind IN ('pull_request', 'changed_file', 'underlying_session')),
     value TEXT NOT NULL,
-    message INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE,
-    PRIMARY KEY (session_key, kind, value)
+    message INTEGER REFERENCES messages (id) ON DELETE CASCADE,
+    raw_stream INTEGER,
+    PRIMARY KEY (session_key, kind, value),
+    CHECK ((message IS NULL) <> (raw_stream IS NULL))
 );
 CREATE INDEX IF NOT EXISTS artifacts_by_message ON artifacts (message);
+CREATE INDEX IF NOT EXISTS artifacts_by_stream ON artifacts (raw_stream);
+CREATE INDEX IF NOT EXISTS artifacts_by_value ON artifacts (value);
 
 CREATE TABLE IF NOT EXISTS media (
     message INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE,
@@ -539,14 +560,19 @@ impl Indexer {
             return Ok(None);
         };
 
-        let (facts, messages) = read_lines(parser, &identity, &bytes[..complete], |at, len| {
-            MessageRef::Log(RawRef {
-                stream: stream.id,
-                generation,
-                start: start + at,
-                end: start + at + len,
+        let (facts, lines) = read_lines(parser, &identity, &bytes[..complete]);
+        let messages: Vec<_> = lines
+            .into_iter()
+            .map(|(message, range)| {
+                let raw = MessageRef::Log(RawRef {
+                    stream: stream.id,
+                    generation,
+                    start: start + range.start,
+                    end: start + range.end,
+                });
+                (message, raw)
             })
-        });
+            .collect();
         let tx = self.db.transaction()?;
         let key = ensure_session(&tx, stream, &identity, &facts)?;
         let mut touched: Vec<String> = Vec::new();
@@ -594,20 +620,53 @@ impl Indexer {
         let Some(identity) = parser.session(&stream.key.locator, None) else {
             return Ok(None);
         };
-        let (facts, messages) = match parser.version(&self.raw.version(latest_checksum)?) {
-            Contents::Facts(facts) => (facts, Vec::new()),
-            Contents::Lines(bytes) => {
-                read_lines(parser, &identity, &bytes, |at, len| MessageRef::Version {
+        let version = parser.version(&identity, &self.raw.version(latest_checksum)?);
+        let messages: Vec<_> = version
+            .messages
+            .into_iter()
+            .map(|(message, range)| {
+                let raw = MessageRef::Version {
                     stream: stream.id,
                     sha256: latest_checksum,
-                    decoded_start: at,
-                    decoded_end: at + len,
-                })
-            }
-        };
+                    decoded_start: range.start,
+                    decoded_end: range.end,
+                };
+                (message, raw)
+            })
+            .collect();
         let tx = self.db.transaction()?;
-        let key = ensure_session(&tx, stream, &identity, &facts)?;
-        let added = index_lines(&tx, stream.key.source, &key, &facts, &messages, Vec::new())?;
+        let key = ensure_session(&tx, stream, &identity, &version.facts)?;
+        if let Some(lifecycle) = version.lifecycle {
+            tx.execute(
+                "UPDATE sessions SET archived_at = ?2, deleted_at = ?3 WHERE key = ?1",
+                params![
+                    key.as_str(),
+                    lifecycle.archived_at.map(|at| at.0),
+                    lifecycle.deleted_at.map(|at| at.0)
+                ],
+            )?;
+        }
+        let mut delete =
+            tx.prepare("DELETE FROM messages WHERE raw_stream = ?1 RETURNING message_id")?;
+        let touched: Vec<String> = delete
+            .query_map([stream.id.0], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(delete);
+        tx.execute("DELETE FROM artifacts WHERE raw_stream = ?1", [stream.id.0])?;
+        for artifact in &version.artifacts {
+            tx.execute(
+                "INSERT OR IGNORE INTO artifacts (session_key, kind, value, raw_stream) VALUES (?1, ?2, ?3, ?4)",
+                params![key.as_str(), artifact.kind.as_str(), artifact.value, stream.id.0],
+            )?;
+        }
+        let added = index_lines(
+            &tx,
+            stream.key.source,
+            &key,
+            &version.facts,
+            &messages,
+            touched,
+        )?;
         tx.execute(
             "INSERT INTO progress (stream, indexed_checksum) VALUES (?1, ?2)
              ON CONFLICT (stream) DO UPDATE SET generation = NULL, indexed_offset = NULL,
@@ -641,21 +700,43 @@ impl Indexer {
     }
 }
 
+/// Raise this when `SCHEMA` changes. An index built for another schema is emptied, and the next sync rebuilds it from the raw layer.
+const SCHEMA_VERSION: i64 = 1;
+
+const TABLES: [&str; 9] = [
+    "message_search",
+    "title_search",
+    "briefs",
+    "progress",
+    "media",
+    "artifacts",
+    "aliases",
+    "messages",
+    "sessions",
+];
+
 /// Opens `index.db` in `dir`, creating its tables if they are missing.
 pub fn open_db(dir: &Path) -> Result<Connection> {
     let db = Connection::open(dir.join("index.db"))?;
     db.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
+    let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version != SCHEMA_VERSION {
+        for table in TABLES {
+            db.execute_batch(&format!("DROP TABLE IF EXISTS {table}"))?;
+        }
+        db.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    }
     db.pragma_update(None, "foreign_keys", "ON")?;
     db.execute_batch(SCHEMA)?;
     Ok(db)
 }
 
+/// The facts and messages of JSONL `bytes`, each message with the byte range of its line.
 fn read_lines(
     parser: &dyn Parser,
     session: &Identity,
     bytes: &[u8],
-    place: impl Fn(u64, u64) -> MessageRef,
-) -> (Facts, Vec<(Message, MessageRef)>) {
+) -> (Facts, Vec<(Message, Range<u64>)>) {
     let mut facts = Facts::default();
     let mut messages = Vec::new();
     let mut at = 0;
@@ -665,7 +746,7 @@ fn read_lines(
             let parsed = parser.line(session, line);
             facts = facts.then(parsed.facts);
             if let Some(message) = parsed.message {
-                messages.push((message, place(at, len)));
+                messages.push((message, at..at + len));
             }
         }
         at += len + 1;

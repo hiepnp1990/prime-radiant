@@ -631,6 +631,48 @@ fn truncated_zst_still_yields_its_complete_leading_lines() {
 }
 
 #[test]
+fn a_new_zst_version_replaces_the_messages_of_the_one_before() {
+    let setup = Setup::new();
+    let whole = fs::read(setup.finished()).expect("finished rollout is readable");
+    let decoded = decompress(&whole);
+    let lines: Vec<&[u8]> = decoded.split_inclusive(|b| *b == b'\n').collect();
+    let kept = lines.len() / 2;
+    let shorter = zstd::stream::encode_all(&lines[..kept].concat()[..], 0).expect("lines compress");
+    fs::remove_dir_all(setup.root.join(DAY)).expect("fixture rollouts are removed");
+    fs::create_dir_all(setup.root.join(DAY)).expect("day folder is created");
+    fs::write(setup.finished(), &whole).expect("finished rollout is written");
+    setup.import();
+    setup.sync();
+    assert_eq!(
+        setup.message_ids(MAIN_KEY),
+        expected_ids(&decoded, SESSION_ID)
+    );
+
+    fs::write(setup.finished(), &shorter).expect("shorter rollout replaces it");
+    assert_eq!(setup.import().versions_stored, 1);
+    setup.sync();
+    let leading = expected_ids(&lines[..kept].concat(), SESSION_ID);
+    assert!(!leading.is_empty() && leading.len() < expected_ids(&decoded, SESSION_ID).len());
+    assert_eq!(
+        setup.message_ids(MAIN_KEY),
+        leading,
+        "the session holds only the new version's messages"
+    );
+    assert_eq!(
+        setup.strings(
+            "SELECT DISTINCT raw_version FROM messages WHERE session_key = ?1",
+            MAIN_KEY
+        ),
+        [Sha256::of(&shorter).to_hex()],
+        "every message points into the new version"
+    );
+    let before = setup.counts();
+    setup.import();
+    assert_eq!(setup.sync(), SyncSummary::default());
+    assert_eq!(setup.counts(), before, "a second sync changes nothing");
+}
+
+#[test]
 fn only_a_fork_marks_messages_as_copies_of_another_thread() {
     const FORK_ID: &str = "0b1c2d3e-4f50-4a61-8b72-c3d4e5f60718";
     const OTHER_ID: &str = "1a2b3c4d-5e6f-4a70-8b81-92a3b4c5d6e7";

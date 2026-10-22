@@ -22,6 +22,7 @@ pub enum WriteMode {
 pub enum Source {
     ClaudeCode,
     Codex,
+    T3Code,
 }
 
 impl Source {
@@ -29,6 +30,7 @@ impl Source {
         match self {
             Source::ClaudeCode => "claude-code",
             Source::Codex => "codex",
+            Source::T3Code => "t3-code",
         }
     }
 
@@ -36,6 +38,7 @@ impl Source {
         match name {
             "claude-code" => Some(Source::ClaudeCode),
             "codex" => Some(Source::Codex),
+            "t3-code" => Some(Source::T3Code),
             _ => None,
         }
     }

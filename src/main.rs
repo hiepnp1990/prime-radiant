@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
-use prime_radiant::collect::{import_claude_code, import_codex, import_t3_code};
+use prime_radiant::collect::{import_claude_code, import_codex, import_grok, import_t3_code};
 use prime_radiant::index::{Indexer, Timestamp};
 use prime_radiant::query::{Brief, Hit, Query, Stats};
 use prime_radiant::raw::{Source, Store};
@@ -25,7 +25,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Import Claude Code, Codex, and T3 Code sessions into the raw layer, then index them.
+    /// Import Claude Code, Codex, Grok, and T3 Code sessions into the raw layer, then index them.
     #[command(group(clap::ArgGroup::new("sources").required(true).multiple(true)))]
     Import {
         #[arg(long)]
@@ -39,6 +39,9 @@ enum Command {
         /// A Codex home folder, such as ~/.codex.
         #[arg(long, group = "sources")]
         codex: Vec<PathBuf>,
+        /// A Grok home folder, such as ~/.grok.
+        #[arg(long, group = "sources")]
+        grok: Vec<PathBuf>,
         /// A T3 Code database, such as ~/.t3/userdata/statev2.sqlite. It is only read.
         #[arg(long = "t3-code", value_name = "DATABASE", group = "sources")]
         t3_code: Vec<PathBuf>,
@@ -89,12 +92,14 @@ fn run(command: Command) -> prime_radiant::Result<()> {
             origin,
             claude_code,
             codex,
+            grok,
             t3_code,
         } => {
             let sources = claude_code
                 .into_iter()
                 .map(|path| (Source::ClaudeCode, path))
                 .chain(codex.into_iter().map(|path| (Source::Codex, path)))
+                .chain(grok.into_iter().map(|path| (Source::Grok, path)))
                 .chain(t3_code.into_iter().map(|path| (Source::T3Code, path)));
             import(&data, &origin, sources)
         }
@@ -147,6 +152,7 @@ fn import(
         let (summary, unit) = match source {
             Source::ClaudeCode => (import_claude_code(&path, origin, &mut store)?, "files"),
             Source::Codex => (import_codex(&path, origin, &mut store)?, "files"),
+            Source::Grok => (import_grok(&path, origin, &mut store)?, "files"),
             Source::T3Code => (import_t3_code(&path, origin, &mut store)?, "threads"),
         };
         println!(

@@ -1,5 +1,6 @@
 pub mod claude_code;
 pub mod codex;
+pub mod grok;
 pub mod t3_code;
 
 use std::collections::HashMap;
@@ -138,6 +139,10 @@ pub fn import_claude_code(root: &Path, origin: &str, store: &mut Store) -> Resul
 
 pub fn import_codex(root: &Path, origin: &str, store: &mut Store) -> Result<ImportSummary> {
     import(&codex::scan(root)?, origin, Source::Codex, store)
+}
+
+pub fn import_grok(root: &Path, origin: &str, store: &mut Store) -> Result<ImportSummary> {
+    import(&grok::scan(root)?, origin, Source::Grok, store)
 }
 
 /// Imports each thread of a T3 Code database as one replace stream. `files_scanned` counts threads.

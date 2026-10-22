@@ -1,0 +1,3 @@
+{"type":"system","content":"You are a coding agent working in a terminal."}
+{"type":"user","content":[{"type":"text","text":"<user_query>\nRename the config loader.\n</user_query>"}],"prompt_index":0}
+{"type":"assistant","content":"Renamed it to `load_config`.","model_id":"example-model"}

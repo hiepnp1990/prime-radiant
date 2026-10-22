@@ -1,5 +1,6 @@
 pub mod claude_code;
 pub mod codex;
+pub mod grok;
 pub mod t3_code;
 
 use std::collections::{HashMap, HashSet};
@@ -10,7 +11,10 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::raw::{Progress, RawRef, Sha256, Source, Stream, StreamId, View};
+use crate::redact::{self, Redacted};
 use crate::{Error, Result};
+
+const TITLE_CHARS: usize = 80;
 
 /// What one source's parser knows: which session a stream feeds, and what its bytes mean.
 pub trait Parser {
@@ -21,12 +25,17 @@ pub trait Parser {
     fn line(&self, session: &Identity, line: &[u8]) -> Line;
     /// The latest version of a replace stream of `session`.
     fn version(&self, session: &Identity, bytes: &[u8]) -> Version;
+    /// Another stream that repeats this stream's messages and is read instead whenever the raw layer has it.
+    fn superseded_by(&self, _locator: &str) -> Option<String> {
+        None
+    }
 }
 
 pub fn parser(source: Source) -> &'static dyn Parser {
     match source {
         Source::ClaudeCode => &claude_code::ClaudeCode,
         Source::Codex => &codex::Codex,
+        Source::Grok => &grok::Grok,
         Source::T3Code => &t3_code::T3Code,
     }
 }
@@ -36,6 +45,8 @@ pub struct Identity {
     pub native_id: String,
     pub lineage: Lineage,
     pub aliases: Vec<Alias>,
+    /// The project, when the locator names it.
+    pub project: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -110,7 +121,7 @@ pub struct Lifecycle {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Line {
-    pub message: Option<Message>,
+    pub messages: Vec<Message>,
     pub facts: Facts,
 }
 
@@ -468,15 +479,31 @@ impl Indexer {
     pub fn sync(&mut self) -> Result<SyncSummary> {
         let indexed = self.indexed()?;
         let mut summary = SyncSummary::default();
-        for stream in self.raw.streams()? {
+        let streams = self.raw.streams()?;
+        let present: HashSet<(&str, Source, &str)> = streams
+            .iter()
+            .map(|s| (s.key.origin.as_str(), s.key.source, s.key.locator.as_str()))
+            .collect();
+        for stream in &streams {
             let parser = parser(stream.key.source);
+            let superseded = parser
+                .superseded_by(&stream.key.locator)
+                .is_some_and(|other| {
+                    present.contains(&(&stream.key.origin, stream.key.source, &other))
+                });
+            if superseded {
+                if self.forget(parser, stream)? {
+                    summary.streams_synced += 1;
+                }
+                continue;
+            }
             let before = indexed.get(&stream.id).copied();
             let added = match stream.state.progress {
                 Progress::Append {
                     confirmed_offset, ..
-                } => self.sync_append(parser, &stream, before, confirmed_offset)?,
+                } => self.sync_append(parser, stream, before, confirmed_offset)?,
                 Progress::Replace { latest_checksum } => {
-                    self.sync_replace(parser, &stream, before, latest_checksum)?
+                    self.sync_replace(parser, stream, before, latest_checksum)?
                 }
             };
             if let Some(added) = added {
@@ -677,6 +704,32 @@ impl Indexer {
         Ok(Some(added))
     }
 
+    /// Removes what a superseded stream indexed, such as before the stream that supersedes it appeared.
+    /// Returns whether the stream had been indexed.
+    fn forget(&mut self, parser: &dyn Parser, stream: &Stream) -> Result<bool> {
+        let tx = self.db.transaction()?;
+        let mut delete =
+            tx.prepare("DELETE FROM messages WHERE raw_stream = ?1 RETURNING message_id")?;
+        let touched: Vec<String> = delete
+            .query_map([stream.id.0], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(delete);
+        let had_progress = tx.execute("DELETE FROM progress WHERE stream = ?1", [stream.id.0])? > 0;
+        if had_progress && let Some(identity) = parser.session(&stream.key.locator, None) {
+            let key = SessionKey::new(stream.key.source, &identity.native_id);
+            index_lines(
+                &tx,
+                stream.key.source,
+                &key,
+                &Facts::default(),
+                &[],
+                touched,
+            )?;
+        }
+        tx.commit()?;
+        Ok(had_progress)
+    }
+
     /// The bytes before the first newline of the stream's current generation, or all of them if it has none yet.
     fn first_line(&self, stream: &Stream, end: u64) -> Result<Vec<u8>> {
         const CHUNK: u64 = 64 * 1024;
@@ -745,7 +798,7 @@ fn read_lines(
         if len > 0 {
             let parsed = parser.line(session, line);
             facts = facts.then(parsed.facts);
-            if let Some(message) = parsed.message {
+            for message in parsed.messages {
                 messages.push((message, at..at + len));
             }
         }
@@ -807,8 +860,8 @@ fn ensure_session(
         }
     };
     tx.execute(
-        "INSERT INTO sessions (key, source, native_id, ran_on, kind, parent_key)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT (key) DO NOTHING",
+        "INSERT INTO sessions (key, source, native_id, ran_on, kind, parent_key, project)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT (key) DO NOTHING",
         params![
             key.as_str(),
             source.as_str(),
@@ -816,6 +869,7 @@ fn ensure_session(
             stream.key.origin,
             kind,
             parent.as_ref().map(SessionKey::as_str),
+            identity.project,
         ],
     )?;
     for alias in &identity.aliases {
@@ -982,4 +1036,31 @@ fn insert_if_new(
         )?;
     }
     Ok(true)
+}
+
+/// A message with `searchable_text`, or `None` when it has no ID or no text.
+pub(crate) fn message(
+    id: Option<String>,
+    role: Role,
+    at: Option<Timestamp>,
+    searchable_text: Option<Redacted>,
+) -> Option<Message> {
+    let searchable_text = searchable_text
+        .map(Redacted::into_string)
+        .filter(|text| !text.is_empty())?;
+    Some(Message {
+        id: id?,
+        parent_id: None,
+        role,
+        at,
+        searchable_text,
+        artifacts: Vec::new(),
+        media: Vec::new(),
+    })
+}
+
+/// `text` as a title: whitespace collapsed, secrets removed, and cut to 80 characters.
+pub(crate) fn heading(text: &str) -> Option<String> {
+    let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!words.is_empty()).then(|| redact::secrets(&words).cut(TITLE_CHARS).into_string())
 }

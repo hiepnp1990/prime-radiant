@@ -18,6 +18,7 @@ impl Parser for T3Code {
         Some(Identity {
             native_id: thread.to_owned(),
             lineage: Lineage::Main,
+            project: None,
             aliases: vec![Alias {
                 kind: AliasKind::NativeId,
                 value: thread.to_owned(),

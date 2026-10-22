@@ -1,0 +1,4 @@
+{"type":"turn_started","ts":"2026-01-15T10:00:01.000Z","session_id":"2b6f0d1e-8c3a-4e7b-9a51-6d2c8f4e1a03","turn_number":1,"conversation_message_count":3}
+{"type":"tool_started","ts":"2026-01-15T10:00:04.000Z","tool_name":"read_file"}
+{"type":"tool_completed","ts":"2026-01-15T10:00:05.000Z","tool_name":"read_file","tool_call_id":"call-9e2b4c1d-7a3f-4e8b-b6d0-2c5f8a1e3d04-0","outcome":"success","duration_ms":12}
+{"type":"turn_ended","ts":"2026-01-15T10:00:09.000Z","outcome":"completed"}

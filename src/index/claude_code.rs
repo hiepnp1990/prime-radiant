@@ -73,8 +73,13 @@ impl Parser for ClaudeCode {
                 ..Facts::default()
             }
         };
-        let message = line.uuid.clone().map(|id| message(id, line));
-        Line { message, facts }
+        let messages = line
+            .uuid
+            .clone()
+            .map(|id| message(id, line))
+            .into_iter()
+            .collect();
+        Line { messages, facts }
     }
 
     fn version(&self, _session: &Identity, bytes: &[u8]) -> Version {
@@ -93,6 +98,7 @@ fn main(session: &str) -> Identity {
     Identity {
         native_id: session.to_owned(),
         lineage: Lineage::Main,
+        project: None,
         aliases: vec![Alias {
             kind: AliasKind::NativeId,
             value: session.to_owned(),
@@ -117,6 +123,7 @@ fn subagent(session: &str, agent: &str) -> Identity {
         lineage: Lineage::Subagent {
             parent_native_id: session.to_owned(),
         },
+        project: None,
     }
 }
 

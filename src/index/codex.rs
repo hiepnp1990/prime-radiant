@@ -5,14 +5,13 @@ use serde::de::{DeserializeOwned, IgnoredAny};
 use serde_json::Value;
 
 use super::{
-    Alias, AliasKind, Facts, Identity, Line, Lineage, Message, Parser, Role, Timestamp, Version,
-    read_lines,
+    Alias, AliasKind, Facts, Identity, Line, Lineage, Parser, Role, Timestamp, Version, heading,
+    message, read_lines,
 };
-use crate::redact::{self, Redacted};
+use crate::redact;
 
 const TOOL_CALL_CHARS: usize = 500;
 const TOOL_OUTPUT_CHARS: usize = 2000;
-const TITLE_CHARS: usize = 80;
 const THREAD_ID_LEN: usize = 36;
 /// The IDE extensions put the open files first and the typed request after this heading.
 const IDE_REQUEST: &str = "## My request";
@@ -39,6 +38,7 @@ impl Parser for Codex {
         Some(Identity {
             native_id: thread.to_owned(),
             lineage: Lineage::Main,
+            project: None,
             aliases: vec![Alias {
                 kind: AliasKind::NativeId,
                 value: thread.to_owned(),
@@ -60,7 +60,7 @@ impl Parser for Codex {
             "session_meta" => payload::<Meta>(line.payload)
                 .filter(|meta| meta.id == session.native_id)
                 .map_or_else(Line::default, |meta| Line {
-                    message: None,
+                    messages: Vec::new(),
                     facts: Facts {
                         started: at,
                         ..meta.facts()
@@ -72,12 +72,14 @@ impl Parser for Codex {
             "compacted" => {
                 let summary = payload::<Compacted>(line.payload).and_then(|c| c.message);
                 Line {
-                    message: message(
+                    messages: message(
                         fallback_id,
                         Role::System,
                         at,
                         summary.as_deref().map(redact::secrets),
-                    ),
+                    )
+                    .into_iter()
+                    .collect(),
                     facts: Facts::default(),
                 }
             }
@@ -262,30 +264,12 @@ impl Item {
             Item::Other => return Line::default(),
         };
         Line {
-            message: message(id.or(fallback_id), role, at, text),
+            messages: message(id.or(fallback_id), role, at, text)
+                .into_iter()
+                .collect(),
             facts,
         }
     }
-}
-
-fn message(
-    id: Option<String>,
-    role: Role,
-    at: Option<Timestamp>,
-    searchable_text: Option<Redacted>,
-) -> Option<Message> {
-    let searchable_text = searchable_text
-        .map(Redacted::into_string)
-        .filter(|text| !text.is_empty())?;
-    Some(Message {
-        id: id?,
-        parent_id: None,
-        role,
-        at,
-        searchable_text,
-        artifacts: Vec::new(),
-        media: Vec::new(),
-    })
 }
 
 fn texts(parts: &[Part]) -> Option<String> {
@@ -331,9 +315,4 @@ fn task_title(parts: &[Part]) -> Option<String> {
             .find_map(|line| line.strip_prefix(TASK_NAME))?;
         heading(name)
     })
-}
-
-fn heading(text: &str) -> Option<String> {
-    let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    (!words.is_empty()).then(|| redact::secrets(&words).cut(TITLE_CHARS).into_string())
 }

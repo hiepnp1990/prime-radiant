@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::index::{self, Timestamp};
 use crate::raw::{Progress, View};
 use crate::redact;
+use crate::transcript::{Matches, Page, Transcript};
 use crate::{Error, Result};
 
 const LIVE_WINDOW_MS: i64 = 10 * 60 * 1000;
@@ -23,7 +24,7 @@ const SNIPPET_TOKENS: i64 = 24;
 const FIRST_REQUEST_CHARS: usize = 600;
 const LAST_ANSWER_CHARS: usize = 1200;
 const CHANGED_FILES: usize = 20;
-const BRIEF_METHOD: &str = "extractive-1";
+pub(crate) const BRIEF_METHOD: &str = "extractive-1";
 
 const STOP_WORDS: &str = "\
     a about above after again against all am an and any are as at be because been before \
@@ -47,7 +48,7 @@ static COMMAND: LazyLock<Regex> = LazyLock::new(|| {
     .expect("command pattern compiles")
 });
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum State {
     Live,
@@ -71,7 +72,7 @@ impl State {
 }
 
 /// One `find` candidate. `score` and `snippet` are `None` when the query was an ID.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Hit {
     pub key: String,
     pub title: Option<String>,
@@ -83,7 +84,7 @@ pub struct Hit {
     pub snippet: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Brief {
     pub key: String,
     pub title: Option<String>,
@@ -124,7 +125,7 @@ pub struct Subagent {
     pub message_count: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Freshness {
     /// The last message position the brief covers.
     pub built_through: Option<i64>,
@@ -133,14 +134,14 @@ pub struct Freshness {
     pub rebuilt: bool,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Stats {
     pub counts: Counts,
     pub streams: Vec<StreamStats>,
     pub sessions: Vec<SessionStats>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Counts {
     pub streams: u64,
     pub segments: u64,
@@ -153,7 +154,7 @@ pub struct Counts {
 }
 
 /// `offset` is set for append streams and `checksum` for replace streams.
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct StreamStats {
     pub locator: String,
     pub generation: u64,
@@ -161,13 +162,32 @@ pub struct StreamStats {
     pub checksum: Option<String>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionStats {
     pub key: String,
     pub message_count: u64,
 }
 
-/// Answers `find`, `brief`, and `stats` from a data directory. Writes only the `briefs` table.
+/// A question that a local data folder and the hub answer the same way.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Ask {
+    Find { query: String, limit: usize },
+    Brief { session: String },
+    Stats,
+    Read { session: String, page: usize },
+    Grep { session: String, pattern: String },
+}
+
+#[derive(Debug)]
+pub enum Answer {
+    Found(Vec<Hit>),
+    Brief(Box<Brief>),
+    Stats(Stats),
+    Page(Page),
+    Matches(Matches),
+}
+
+/// Answers questions from a data directory, reading only. A brief it rebuilt is for the indexer to store.
 pub struct Query {
     dir: std::path::PathBuf,
     db: Connection,
@@ -184,9 +204,34 @@ impl Query {
         }
         Ok(Self {
             dir: dir.to_owned(),
-            db: index::open_db(dir)?,
+            db: index::open_reader(dir)?,
             now,
         })
+    }
+
+    pub fn answer(&self, ask: Ask) -> Result<Answer> {
+        Ok(match ask {
+            Ask::Find { query, limit } => Answer::Found(self.find(&query, limit)?),
+            Ask::Brief { session } => Answer::Brief(Box::new(self.brief(&session)?)),
+            Ask::Stats => Answer::Stats(self.stats()?),
+            Ask::Read { session, page } => Answer::Page(self.read(&session, page)?),
+            Ask::Grep { session, pattern } => Answer::Matches(self.grep(&session, &pattern)?),
+        })
+    }
+
+    /// One page of the session's messages.
+    pub fn read(&self, session: &str, page: usize) -> Result<Page> {
+        self.transcript(session)?.page(page)
+    }
+
+    /// The first matches of `pattern` in the session's messages, with the page of `read` that shows each one.
+    pub fn grep(&self, session: &str, pattern: &str) -> Result<Matches> {
+        self.transcript(session)?.grep(pattern)
+    }
+
+    fn transcript(&self, session: &str) -> Result<Transcript> {
+        let key = self.one_session(session)?;
+        Transcript::render(&self.db, &View::open(&self.dir)?, &key)
     }
 
     /// An exact key or alias wins, then a unique ID prefix, then full-text search.
@@ -202,17 +247,7 @@ impl Query {
     }
 
     pub fn brief(&self, session: &str) -> Result<Brief> {
-        let key = match self.resolve(session)?.as_slice() {
-            [key] => key.clone(),
-            [] => return Err(Error::Usage(format!("no session matches {session}"))),
-            several => {
-                return Err(Error::Usage(format!(
-                    "{session} matches {} sessions: {}",
-                    several.len(),
-                    several.join(", ")
-                )));
-            }
-        };
+        let key = self.one_session(session)?;
         let (title, project, origin, parent, started, last_activity, archived_at, deleted_at) =
             self.db.query_row(
                 "SELECT title, project, ran_on, parent_key, started_at, last_activity, archived_at, deleted_at
@@ -256,6 +291,18 @@ impl Query {
             body,
             freshness,
         })
+    }
+
+    fn one_session(&self, session: &str) -> Result<String> {
+        match self.resolve(session)?.as_slice() {
+            [key] => Ok(key.clone()),
+            [] => Err(Error::Usage(format!("no session matches {session}"))),
+            several => Err(Error::Usage(format!(
+                "{session} matches {} sessions: {}",
+                several.len(),
+                several.join(", ")
+            ))),
+        }
     }
 
     /// The sessions an ID names, best first. Empty when the input is not an ID.
@@ -539,13 +586,6 @@ impl Query {
             return Ok((body, freshness));
         }
         let body = self.extract(key)?;
-        let json = serde_json::to_string(&body).expect("a brief serializes");
-        self.db.execute(
-            "INSERT INTO briefs (session_key, body, built_through, built_at, method) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT (session_key) DO UPDATE SET body = excluded.body, built_through = excluded.built_through,
-                built_at = excluded.built_at, method = excluded.method",
-            params![key, json, latest, self.now.0, BRIEF_METHOD],
-        )?;
         let freshness = Freshness {
             built_through: latest,
             built_at: self.now,

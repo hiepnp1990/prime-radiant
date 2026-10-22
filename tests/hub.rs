@@ -12,6 +12,7 @@ use prime_radiant::collect::{self, t3_code};
 use prime_radiant::protocol::{
     self, Request, Response, Role, read_request, read_response, write_request,
 };
+use prime_radiant::query::Ask;
 use prime_radiant::raw::{Progress, RawRef, Sha256, Source, StreamKey, View, Write, WriteMode};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Value, json};
@@ -417,10 +418,10 @@ impl Client {
     }
 
     fn find_keys(&mut self, query: &str) -> Vec<String> {
-        let request = Request::Find {
+        let request = Request::Ask(Ask::Find {
             query: query.to_owned(),
             limit: 10,
-        };
+        });
         match self.call(request) {
             Some(Response::Found {
                 hits: Value::Array(hits),
@@ -1096,7 +1097,7 @@ fn bad_requests_close_only_their_own_connection() {
         (
             "a request before hello",
             Client::connect(&setup.data),
-            Some(Request::Stats),
+            Some(Request::Ask(Ask::Stats)),
         ),
         (
             "a newer protocol",
@@ -1132,7 +1133,10 @@ fn bad_requests_close_only_their_own_connection() {
 
     let mut client = Client::hello(&setup.data, "example-reader", Role::Client);
     assert!(
-        matches!(client.call(Request::Stats), Some(Response::Stats { .. })),
+        matches!(
+            client.call(Request::Ask(Ask::Stats)),
+            Some(Response::Stats { .. })
+        ),
         "the hub still answers new connections"
     );
 }
@@ -1184,7 +1188,10 @@ fn a_second_writer_cannot_open_a_served_data_directory() {
     }
     let mut client = Client::hello(&setup.data, "example-reader", Role::Client);
     assert!(
-        matches!(client.call(Request::Stats), Some(Response::Stats { .. })),
+        matches!(
+            client.call(Request::Ask(Ask::Stats)),
+            Some(Response::Stats { .. })
+        ),
         "the hub keeps serving"
     );
 }

@@ -5,13 +5,11 @@ use serde::de::{DeserializeOwned, IgnoredAny};
 use serde_json::Value;
 
 use super::{
-    Alias, AliasKind, Facts, Identity, Line, Lineage, Parser, Role, Timestamp, Version, heading,
-    message, read_lines,
+    Alias, AliasKind, Cuts, Facts, Identity, Line, Lineage, Parser, Role, Timestamp, Version,
+    heading, message, read_lines,
 };
 use crate::redact;
 
-const TOOL_CALL_CHARS: usize = 500;
-const TOOL_OUTPUT_CHARS: usize = 2000;
 const THREAD_ID_LEN: usize = 36;
 /// The IDE extensions put the open files first and the typed request after this heading.
 const IDE_REQUEST: &str = "## My request";
@@ -46,7 +44,7 @@ impl Parser for Codex {
         })
     }
 
-    fn line(&self, session: &Identity, line: &[u8]) -> Line {
+    fn line(&self, session: &Identity, line: &[u8], cuts: Cuts) -> Line {
         let Ok(line) = serde_json::from_slice::<RawLine>(line) else {
             return Line::default();
         };
@@ -67,7 +65,7 @@ impl Parser for Codex {
                     },
                 }),
             "response_item" => payload::<Item>(line.payload)
-                .map(|item| item.line(fallback_id, at))
+                .map(|item| item.line(fallback_id, at, cuts))
                 .unwrap_or_default(),
             "compacted" => {
                 let summary = payload::<Compacted>(line.payload).and_then(|c| c.message);
@@ -87,8 +85,8 @@ impl Parser for Codex {
         }
     }
 
-    fn version(&self, session: &Identity, bytes: &[u8]) -> Version {
-        let (facts, messages) = read_lines(self, session, &decoded_prefix(bytes));
+    fn version(&self, session: &Identity, bytes: &[u8], cuts: Cuts) -> Version {
+        let (facts, messages) = read_lines(self, session, &decoded_prefix(bytes), cuts);
         Version {
             facts,
             messages,
@@ -212,7 +210,7 @@ enum Output {
 }
 
 impl Item {
-    fn line(self, fallback_id: Option<String>, at: Option<Timestamp>) -> Line {
+    fn line(self, fallback_id: Option<String>, at: Option<Timestamp>, cuts: Cuts) -> Line {
         let mut facts = Facts::default();
         let (id, role, text) = match self {
             Item::Message { id, role, content } => {
@@ -241,11 +239,11 @@ impl Item {
             } => {
                 let input = serde_json::from_str(&arguments).unwrap_or(Value::String(arguments));
                 let call = redact::tool_call(&name, &input);
-                (id, Role::ToolCall, Some(call.cut(TOOL_CALL_CHARS)))
+                (id, Role::ToolCall, Some(call.cut(cuts.tool_call)))
             }
             Item::CustomToolCall { id, name, input } => {
                 let call = redact::secrets(&format!("{name} {input}"));
-                (id, Role::ToolCall, Some(call.cut(TOOL_CALL_CHARS)))
+                (id, Role::ToolCall, Some(call.cut(cuts.tool_call)))
             }
             Item::FunctionCallOutput { id, output } | Item::CustomToolCallOutput { id, output } => {
                 let text = match output {
@@ -253,7 +251,7 @@ impl Item {
                     Output::Parts(parts) => texts(&parts),
                     Output::Other(_) => None,
                 };
-                let text = text.map(|text| redact::secrets(&text).cut(TOOL_OUTPUT_CHARS));
+                let text = text.map(|text| redact::secrets(&text).cut(cuts.tool_result));
                 (id, Role::ToolResult, text)
             }
             Item::Reasoning { id, summary } => (

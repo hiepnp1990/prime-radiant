@@ -2,14 +2,12 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    Alias, AliasKind, Facts, Identity, Line, Lineage, Parser, Role, Timestamp, Version, heading,
-    message,
+    Alias, AliasKind, Cuts, Facts, Identity, Line, Lineage, Parser, Role, Timestamp, Version,
+    heading, message,
 };
 use crate::raw::Sha256;
 use crate::redact::{self, Redacted};
 
-const TOOL_CALL_CHARS: usize = 500;
-const TOOL_OUTPUT_CHARS: usize = 2000;
 const SESSION_ID_LEN: usize = 36;
 const CHAT_HISTORY: &str = "chat_history.jsonl";
 const EVENTS: &str = "events.jsonl";
@@ -42,11 +40,11 @@ impl Parser for Grok {
     }
 
     /// Reads a line of any of the three logs: an update has `params`, an event has `ts`, and a chat history line has neither.
-    fn line(&self, session: &Identity, line: &[u8]) -> Line {
+    fn line(&self, session: &Identity, line: &[u8], cuts: Cuts) -> Line {
         // Chat history lines carry no IDs of their own, so a line's hash names it within its session.
         let line_id = || format!("{}:{}", session.native_id, &Sha256::of(line).to_hex()[..16]);
         match serde_json::from_slice::<RawLine>(line) {
-            Ok(RawLine::Update(update)) => update.line(line_id),
+            Ok(RawLine::Update(update)) => update.line(line_id, cuts),
             Ok(RawLine::Event { ts }) => Line {
                 facts: Facts {
                     started: Timestamp::parse_utc(&ts),
@@ -54,12 +52,12 @@ impl Parser for Grok {
                 },
                 ..Line::default()
             },
-            Ok(RawLine::Chat(chat)) => chat.line(&session.native_id, line_id),
+            Ok(RawLine::Chat(chat)) => chat.line(&session.native_id, line_id, cuts),
             Err(_) => Line::default(),
         }
     }
 
-    fn version(&self, _session: &Identity, bytes: &[u8]) -> Version {
+    fn version(&self, _session: &Identity, bytes: &[u8], _cuts: Cuts) -> Version {
         let Ok(summary) = serde_json::from_slice::<Summary>(bytes) else {
             return Version::default();
         };
@@ -180,7 +178,7 @@ enum ToolContent {
 }
 
 impl UpdateLine {
-    fn line(self, line_id: impl Fn() -> String) -> Line {
+    fn line(self, line_id: impl Fn() -> String, cuts: Cuts) -> Line {
         let at = self
             .params
             .meta
@@ -208,7 +206,7 @@ impl UpdateLine {
                 raw_input,
             } => (
                 Role::ToolCall,
-                Some(tool_call(&title.unwrap_or(tool_call_id), &raw_input)),
+                Some(tool_call(&title.unwrap_or(tool_call_id), &raw_input, cuts)),
             ),
             SessionUpdate::ToolCallUpdate {
                 status: Some(status),
@@ -223,7 +221,7 @@ impl UpdateLine {
                         ToolContent::Other => None,
                     })
                     .collect();
-                (Role::ToolResult, Some(tool_output(&texts.join("\n"))))
+                (Role::ToolResult, Some(tool_output(&texts.join("\n"), cuts)))
             }
             _ => {
                 return Line {
@@ -277,7 +275,7 @@ struct ChatToolCall {
 }
 
 impl ChatLine {
-    fn line(self, session: &str, line_id: impl Fn() -> String) -> Line {
+    fn line(self, session: &str, line_id: impl Fn() -> String, cuts: Cuts) -> Line {
         let scoped = |id: &str| format!("{session}:{id}");
         let mut facts = Facts::default();
         let messages = match self {
@@ -314,7 +312,7 @@ impl ChatLine {
                         Some(scoped(&call.id)),
                         Role::ToolCall,
                         None,
-                        Some(tool_call(&call.name, &input)),
+                        Some(tool_call(&call.name, &input, cuts)),
                     )
                 });
                 text.into_iter().chain(calls).collect()
@@ -326,7 +324,7 @@ impl ChatLine {
                 Some(scoped(&format!("{tool_call_id}:result"))),
                 Role::ToolResult,
                 None,
-                content.as_deref().map(tool_output),
+                content.as_deref().map(|text| tool_output(text, cuts)),
             )
             .into_iter()
             .collect(),
@@ -361,12 +359,12 @@ fn texts(parts: &[Text]) -> Option<String> {
     (!texts.is_empty()).then(|| texts.join("\n"))
 }
 
-fn tool_call(name: &str, input: &Value) -> Redacted {
-    redact::tool_call(name, input).cut(TOOL_CALL_CHARS)
+fn tool_call(name: &str, input: &Value, cuts: Cuts) -> Redacted {
+    redact::tool_call(name, input).cut(cuts.tool_call)
 }
 
-fn tool_output(text: &str) -> Redacted {
-    redact::secrets(text).cut(TOOL_OUTPUT_CHARS)
+fn tool_output(text: &str, cuts: Cuts) -> Redacted {
+    redact::secrets(text).cut(cuts.tool_result)
 }
 
 /// Decodes `%XX` escapes, the way Grok names a session's working folder.

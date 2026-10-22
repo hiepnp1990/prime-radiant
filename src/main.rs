@@ -3,15 +3,20 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
-use prime_radiant::collect::live::{self, HubAddress};
+use prime_radiant::client::{self, HubAddress};
+use prime_radiant::collect::live;
 use prime_radiant::collect::{import_claude_code, import_codex, import_grok, import_t3_code};
 use prime_radiant::hub;
 use prime_radiant::index::{Indexer, Timestamp};
-use prime_radiant::query::{Brief, Hit, Query, Stats};
+use prime_radiant::protocol::Request;
+use prime_radiant::query::{Answer, Ask, Brief, Hit, Query, Stats};
 use prime_radiant::raw::{Source, Store};
+use prime_radiant::transcript::{Matches, Page};
 use serde::Serialize;
 
 const WIDTH: usize = 100;
+/// A hub command for query commands given no `--data`, `--hub-socket`, or `--hub-command`.
+const HUB_ENV: &str = "PRIME_RADIANT_HUB";
 
 #[derive(Parser)]
 #[command(
@@ -39,8 +44,8 @@ enum Command {
     },
     /// Count what the store holds, and list every stream and session.
     Stats {
-        #[arg(long)]
-        data: PathBuf,
+        #[command(flatten)]
+        target: Target,
         #[arg(long)]
         json: bool,
     },
@@ -48,8 +53,8 @@ enum Command {
     Find {
         #[arg(required = true, num_args = 1..)]
         query: Vec<String>,
-        #[arg(long)]
-        data: PathBuf,
+        #[command(flatten)]
+        target: Target,
         #[arg(long)]
         json: bool,
         #[arg(long, default_value_t = 10)]
@@ -59,8 +64,31 @@ enum Command {
     Brief {
         /// A session key, an alias, or a unique ID prefix of 8 or more characters.
         session: String,
+        #[command(flatten)]
+        target: Target,
         #[arg(long)]
-        data: PathBuf,
+        json: bool,
+    },
+    /// Print one page of a session's messages, about 12,000 characters, with secrets removed.
+    Read {
+        /// A session key, an alias, or a unique ID prefix of 8 or more characters.
+        session: String,
+        #[arg(long, default_value_t = 1)]
+        page: usize,
+        #[command(flatten)]
+        target: Target,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search one session's messages for text, ignoring case, and name the page of each match.
+    Grep {
+        /// A session key, an alias, or a unique ID prefix of 8 or more characters.
+        session: String,
+        /// The text to find. Several words are searched as one phrase.
+        #[arg(required = true, num_args = 1..)]
+        pattern: Vec<String>,
+        #[command(flatten)]
+        target: Target,
         #[arg(long)]
         json: bool,
     },
@@ -127,6 +155,81 @@ enum HubCommand {
     },
 }
 
+/// Where a query is answered: a local data folder, or a hub. With no flag, the hub command in PRIME_RADIANT_HUB.
+#[derive(Args)]
+#[group(multiple = false)]
+struct Target {
+    /// A data folder on this machine.
+    #[arg(long)]
+    data: Option<PathBuf>,
+    /// The hub's socket on this machine, <data>/hub.sock.
+    #[arg(long)]
+    hub_socket: Option<PathBuf>,
+    /// A command whose stdin and stdout reach the hub, such as "ssh <host> prime-radiant hub connect --data <dir>".
+    #[arg(long)]
+    hub_command: Option<String>,
+}
+
+/// Who answers a query, and the flags that name it again, for the command that reads the next page.
+struct Answerer {
+    at: At,
+    flags: String,
+}
+
+enum At {
+    Local(PathBuf),
+    Hub(HubAddress),
+}
+
+impl Target {
+    fn answerer(self) -> prime_radiant::Result<Answerer> {
+        let (at, flags) = match (self.data, self.hub_socket, self.hub_command) {
+            (Some(dir), _, _) => {
+                let flags = format!(" --data {}", quoted(&dir.to_string_lossy()));
+                (At::Local(dir), flags)
+            }
+            (None, Some(socket), _) => {
+                let flags = format!(" --hub-socket {}", quoted(&socket.to_string_lossy()));
+                (At::Hub(HubAddress::Socket(socket)), flags)
+            }
+            (None, None, Some(command)) => {
+                let flags = format!(" --hub-command {}", quoted(&command));
+                (At::Hub(HubAddress::Command(command)), flags)
+            }
+            (None, None, None) => match std::env::var(HUB_ENV) {
+                Ok(command) if !command.trim().is_empty() => {
+                    (At::Hub(HubAddress::Command(command)), String::new())
+                }
+                _ => {
+                    return Err(prime_radiant::Error::Usage(format!(
+                        "give --data, --hub-socket, or --hub-command, or set {HUB_ENV} to a command that reaches the hub"
+                    )));
+                }
+            },
+        };
+        Ok(Answerer { at, flags })
+    }
+}
+
+impl Answerer {
+    fn ask(&self, ask: Ask) -> prime_radiant::Result<Answer> {
+        match &self.at {
+            At::Hub(hub) => Answer::try_from(client::ask(hub, Request::Ask(ask))?),
+            At::Local(dir) => {
+                let answer = Query::open(dir, now())?.answer(ask)?;
+                if let Answer::Brief(brief) = &answer
+                    && brief.freshness.rebuilt
+                    && let Err(error) =
+                        Indexer::open(dir).and_then(|mut index| index.store_brief(brief))
+                {
+                    eprintln!("warning: the rebuilt brief was not stored: {error}");
+                }
+                Ok(answer)
+            }
+        }
+    }
+}
+
 #[derive(Args)]
 #[group(required = true, multiple = false)]
 struct HubArgs {
@@ -155,41 +258,41 @@ fn run(command: Command) -> prime_radiant::Result<()> {
             origin,
             sources,
         } => import(&data, &origin, sources.into_list()),
-        Command::Stats { data, json } => {
-            let stats = Query::open(&data, now())?.stats()?;
-            if json {
-                print_json(&stats);
-            } else {
-                print!("{}", stats_text(&stats));
-            }
-            Ok(())
-        }
+        Command::Stats { target, json } => query(target, Ask::Stats, json),
         Command::Find {
-            query,
-            data,
+            query: words,
+            target,
             json,
             limit,
         } => {
-            let hits = Query::open(&data, now())?.find(&query.join(" "), limit)?;
-            if json {
-                print_json(&hits);
-            } else {
-                print!("{}", hits_text(&hits));
-            }
-            Ok(())
+            let ask = Ask::Find {
+                query: words.join(" "),
+                limit,
+            };
+            query(target, ask, json)
         }
         Command::Brief {
             session,
-            data,
+            target,
+            json,
+        } => query(target, Ask::Brief { session }, json),
+        Command::Read {
+            session,
+            page,
+            target,
+            json,
+        } => query(target, Ask::Read { session, page }, json),
+        Command::Grep {
+            session,
+            pattern,
+            target,
             json,
         } => {
-            let brief = Query::open(&data, now())?.brief(&session)?;
-            if json {
-                print_json(&brief);
-            } else {
-                print!("{}", brief_text(&brief));
-            }
-            Ok(())
+            let ask = Ask::Grep {
+                session,
+                pattern: pattern.join(" "),
+            };
+            query(target, ask, json)
         }
         Command::Hub {
             command: HubCommand::Serve { data },
@@ -213,6 +316,32 @@ fn run(command: Command) -> prime_radiant::Result<()> {
             sweep: Duration::from_secs(sweep_seconds),
         }),
     }
+}
+
+fn query(target: Target, ask: Ask, json: bool) -> prime_radiant::Result<()> {
+    let answerer = target.answerer()?;
+    let answer = answerer.ask(ask)?;
+    if json {
+        match &answer {
+            Answer::Found(hits) => print_json(hits),
+            Answer::Brief(brief) => print_json(brief),
+            Answer::Stats(stats) => print_json(stats),
+            Answer::Page(page) => print_json(page),
+            Answer::Matches(matches) => print_json(matches),
+        }
+    } else {
+        print!(
+            "{}",
+            match &answer {
+                Answer::Found(hits) => hits_text(hits),
+                Answer::Brief(brief) => brief_text(brief),
+                Answer::Stats(stats) => stats_text(stats),
+                Answer::Page(page) => page_text(page, &answerer.flags),
+                Answer::Matches(matches) => matches_text(matches),
+            }
+        );
+    }
+    Ok(())
 }
 
 fn import(data: &Path, origin: &str, sources: Vec<(Source, PathBuf)>) -> prime_radiant::Result<()> {
@@ -397,6 +526,63 @@ fn brief_text(brief: &Brief) -> String {
         }
     }
     out
+}
+
+fn page_text(page: &Page, flags: &str) -> String {
+    let mut out = page.text();
+    if page.page < page.pages {
+        out += &format!(
+            "\npage {} of {}. Next page: prime-radiant read {} --page {}{flags}\n",
+            page.page,
+            page.pages,
+            quoted(&page.key),
+            page.page + 1
+        );
+    } else {
+        out += &format!("\npage {} of {}, the last page.\n", page.page, page.pages);
+    }
+    out
+}
+
+fn matches_text(matches: &Matches) -> String {
+    let pattern = &matches.pattern;
+    if matches.total == 0 {
+        return format!("no matches for \"{pattern}\" in {}\n", matches.key);
+    }
+    let noun = if matches.total == 1 {
+        "match"
+    } else {
+        "matches"
+    };
+    let mut out = format!(
+        "{} {noun} for \"{pattern}\" in {}",
+        matches.total, matches.key
+    );
+    if matches.total > matches.matches.len() {
+        out += &format!(", the first {} shown", matches.matches.len());
+    }
+    out += "\n";
+    for found in &matches.matches {
+        out += &format!(
+            "\n[{}] {}, page {}:\n",
+            found.position, found.role, found.page
+        );
+        out += &wrap(&found.context, "  ");
+    }
+    out
+}
+
+/// `text` as one shell word.
+fn quoted(text: &str) -> String {
+    let plain = !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:=@%+,".contains(c));
+    if plain {
+        text.to_owned()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
 }
 
 /// A path inside the project, relative to it.

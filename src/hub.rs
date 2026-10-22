@@ -1,8 +1,9 @@
 //! The hub: the process that owns a data directory and serves it on `<dir>/hub.sock`.
 //!
 //! Each database has one writer. The intake thread owns the `Store` and is the only writer of `raw.db`. The index
-//! thread owns the `Indexer` and is the only writer of `index.db`; it also answers queries, because a brief writes
-//! to `index.db` too. Each connection gets a thread that parses requests and hands them to the owner.
+//! thread owns the `Indexer` and is the only writer of `index.db`; it also answers queries, because a query may
+//! rebuild a brief, which the indexer then stores. Each connection gets a thread that parses requests and hands them
+//! to the owner.
 
 use std::fs::{self, DirBuilder, Permissions};
 use std::io::{self, BufReader, BufWriter, Read, Write as _};
@@ -17,7 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::index::{Indexer, Timestamp};
 use crate::protocol::{self, Request, Response, Role};
-use crate::query::Query;
+use crate::query::{Answer, Ask, Query};
 use crate::raw::{Applied, Source, Store, StreamKey, StreamState, Write};
 use crate::{Error, Result};
 
@@ -109,15 +110,9 @@ enum Index {
     /// New bytes or a new version reached the raw layer.
     Changed,
     Query {
-        query: Ask,
+        ask: Ask,
         reply: Sender<Result<Response>>,
     },
-}
-
-enum Ask {
-    Find { query: String, limit: usize },
-    Brief { session: String },
-    Stats,
 }
 
 #[derive(Clone)]
@@ -220,11 +215,12 @@ fn run_index(mut indexer: Indexer, dir: &Path, commands: Receiver<Index>) {
         };
         match command {
             Some(Index::Changed) => timer.changed(Instant::now()),
-            Some(Index::Query { query, reply }) => {
+            Some(Index::Query { ask, reply }) => {
                 if timer.due.is_some() {
                     sync(&mut indexer, &mut timer);
                 }
-                let _ = reply.send(guard("answering a query", || answer(dir, query)));
+                let answered = guard("answering a query", || answer(dir, &mut indexer, ask));
+                let _ = reply.send(answered);
             }
             None => sync(&mut indexer, &mut timer),
         }
@@ -242,26 +238,21 @@ fn sync(indexer: &mut Indexer, timer: &mut SyncTimer) {
     timer.synced(result.is_ok(), Instant::now());
 }
 
-fn answer(dir: &Path, query: Ask) -> Result<Response> {
+/// Answers from a fresh read-only view of the index, and stores a brief the answer rebuilt, so that the index thread's
+/// indexer stays the only writer of `index.db`.
+fn answer(dir: &Path, indexer: &mut Indexer, ask: Ask) -> Result<Response> {
     let now = Timestamp(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_millis() as i64),
     );
-    let reader = Query::open(dir, now)?;
-    let json =
-        |value: serde_json::Result<serde_json::Value>| value.expect("query results serialize");
-    Ok(match query {
-        Ask::Find { query, limit } => Response::Found {
-            hits: json(serde_json::to_value(reader.find(&query, limit)?)),
-        },
-        Ask::Brief { session } => Response::Brief {
-            brief: json(serde_json::to_value(reader.brief(&session)?)),
-        },
-        Ask::Stats => Response::Stats {
-            stats: json(serde_json::to_value(reader.stats()?)),
-        },
-    })
+    let answer = Query::open(dir, now)?.answer(ask)?;
+    if let Answer::Brief(brief) = &answer
+        && brief.freshness.rebuilt
+    {
+        indexer.store_brief(brief)?;
+    }
+    Ok(answer.into())
 }
 
 fn accept(listener: UnixListener, owners: Owners) {
@@ -377,14 +368,12 @@ fn respond(peer: &mut Option<Peer>, request: Request, owners: &Owners) -> Reply 
             .map_or_else(stopped, |result| {
                 reply(result.map(|(outcome, state)| Response::Applied { outcome, state }))
             }),
-        Request::Find { query, limit } => query_index(owners, Ask::Find { query, limit }),
-        Request::Brief { session } => query_index(owners, Ask::Brief { session }),
-        Request::Stats => query_index(owners, Ask::Stats),
+        Request::Ask(question) => ask(&owners.index, |reply| Index::Query {
+            ask: question,
+            reply,
+        })
+        .map_or_else(stopped, reply),
     }
-}
-
-fn query_index(owners: &Owners, query: Ask) -> Reply {
-    ask(&owners.index, |reply| Index::Query { query, reply }).map_or_else(stopped, reply)
 }
 
 /// Sends a command to an owner thread and waits for its answer, or `None` if the owner stopped.

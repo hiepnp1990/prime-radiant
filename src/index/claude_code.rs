@@ -6,14 +6,12 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    Alias, AliasKind, Artifact, ArtifactKind, Facts, Identity, Line, Lineage, Media, Message,
+    Alias, AliasKind, Artifact, ArtifactKind, Cuts, Facts, Identity, Line, Lineage, Media, Message,
     Parser, Role, Timestamp, Version,
 };
 use crate::raw::Sha256;
 use crate::redact;
 
-const TOOL_USE_CHARS: usize = 500;
-const TOOL_RESULT_CHARS: usize = 2000;
 const ATTACHMENT_CHARS: usize = 500;
 
 const PERSISTED_OUTPUT: &str = "<persisted-output>";
@@ -53,7 +51,7 @@ impl Parser for ClaudeCode {
         }
     }
 
-    fn line(&self, session: &Identity, line: &[u8]) -> Line {
+    fn line(&self, session: &Identity, line: &[u8], cuts: Cuts) -> Line {
         let Ok(line) = serde_json::from_slice::<RawLine>(line) else {
             return Line::default();
         };
@@ -76,13 +74,13 @@ impl Parser for ClaudeCode {
         let messages = line
             .uuid
             .clone()
-            .map(|id| message(id, line))
+            .map(|id| message(id, line, cuts))
             .into_iter()
             .collect();
         Line { messages, facts }
     }
 
-    fn version(&self, _session: &Identity, bytes: &[u8]) -> Version {
+    fn version(&self, _session: &Identity, bytes: &[u8], _cuts: Cuts) -> Version {
         let file: MetadataFile = serde_json::from_slice(bytes).unwrap_or_default();
         Version {
             facts: Facts {
@@ -199,12 +197,17 @@ struct ImageSource {
     data: Option<String>,
 }
 
-fn message(id: String, line: RawLine) -> Message {
+fn message(id: String, line: RawLine, cuts: Cuts) -> Message {
     let content = line
         .message
         .and_then(|message| message.content)
         .or(line.content);
-    let mut found = Found::default();
+    let mut found = Found {
+        cuts,
+        pieces: Vec::new(),
+        artifacts: Vec::new(),
+        media: Vec::new(),
+    };
     if let Some(content) = &content {
         found.content(content);
     }
@@ -250,8 +253,8 @@ fn role(kind: &str, is_meta: bool, content: Option<&Content>) -> Role {
     }
 }
 
-#[derive(Default)]
 struct Found {
+    cuts: Cuts,
     pieces: Vec<String>,
     artifacts: Vec<Artifact>,
     media: Vec<Media>,
@@ -297,7 +300,8 @@ impl Found {
         }
         let text = redact::tool_call(name, input);
         self.pull_requests(text.as_str());
-        self.pieces.push(text.cut(TOOL_USE_CHARS).into_string());
+        self.pieces
+            .push(text.cut(self.cuts.tool_call).into_string());
     }
 
     fn tool_result(&mut self, content: Option<&Content>) {
@@ -316,7 +320,7 @@ impl Found {
             _ => {}
         }
         let text = parts.join("\n");
-        let limit = (!text.starts_with(PERSISTED_OUTPUT)).then_some(TOOL_RESULT_CHARS);
+        let limit = (!text.starts_with(PERSISTED_OUTPUT)).then_some(self.cuts.tool_result);
         self.text(&text, limit);
     }
 

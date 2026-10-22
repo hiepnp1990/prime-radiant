@@ -7,11 +7,11 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, BufReader, BufWriter, Read};
+use std::io::{self, BufReader, BufWriter};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -19,6 +19,7 @@ use std::time::{Duration, Instant, SystemTime};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use super::{Layout, LocalFile, layout, next_write, plan_version, t3_code};
+use crate::client::{HubAddress, Transport};
 use crate::protocol::{self, Request, Response, Role};
 use crate::raw::{Applied, Source, StreamKey, StreamState, Write, WriteMode};
 use crate::{Error, Result};
@@ -34,13 +35,6 @@ const STALL_TIMEOUT: Duration = Duration::from_secs(60);
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 const WRITE_CHUNK: usize = 64 * 1024;
-
-pub enum HubAddress {
-    /// The hub's socket on this machine.
-    Socket(PathBuf),
-    /// A shell command whose stdin and stdout reach the hub, such as `ssh <host> prime-radiant hub connect --data <dir>`.
-    Command(String),
-}
 
 pub struct Options {
     pub origin: String,
@@ -259,33 +253,12 @@ struct Link {
 
 impl Link {
     fn open(address: &HubAddress, id: u64, inbound: &Sender<Inbound>) -> io::Result<Self> {
-        let (from_hub, to_hub, socket, child): (
-            Box<dyn Read + Send>,
-            Box<dyn io::Write + Send>,
-            _,
-            _,
-        ) = match address {
-            HubAddress::Socket(path) => {
-                let socket = UnixStream::connect(path)?;
-                (
-                    Box::new(socket.try_clone()?),
-                    Box::new(socket.try_clone()?),
-                    Some(socket),
-                    None,
-                )
-            }
-            HubAddress::Command(command) => {
-                let mut child = Command::new("sh")
-                    .arg("-c")
-                    .arg(command)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .spawn()?;
-                let stdin = child.stdin.take().expect("stdin is piped");
-                let stdout = child.stdout.take().expect("stdout is piped");
-                (Box::new(stdout), Box::new(stdin), None, Some(child))
-            }
-        };
+        let Transport {
+            from_hub,
+            to_hub,
+            socket,
+            child,
+        } = address.open()?;
 
         let responses = inbound.clone();
         thread::spawn(move || {

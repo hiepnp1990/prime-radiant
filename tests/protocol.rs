@@ -4,6 +4,7 @@ use prime_radiant::protocol::{
     self, MAX_PAYLOAD_BYTES, Request, Response, Role, read_request, read_response, write_request,
     write_response,
 };
+use prime_radiant::query::Ask;
 use prime_radiant::raw::{
     Applied, HeadCheck, Progress, Rejection, Sha256, Source, StreamKey, StreamState, Write,
 };
@@ -71,14 +72,22 @@ fn every_request_survives_a_round_trip() {
             key: key(),
             generation: 3,
         }),
-        Request::Find {
+        Request::Ask(Ask::Find {
             query: "json flag".to_owned(),
             limit: 10,
-        },
-        Request::Brief {
+        }),
+        Request::Ask(Ask::Brief {
             session: "33831ab7".to_owned(),
-        },
-        Request::Stats,
+        }),
+        Request::Ask(Ask::Read {
+            session: "33831ab7".to_owned(),
+            page: 2,
+        }),
+        Request::Ask(Ask::Grep {
+            session: "33831ab7".to_owned(),
+            pattern: "json flag".to_owned(),
+        }),
+        Request::Ask(Ask::Stats),
     ];
     let frames: Vec<u8> = requests.iter().flat_map(encode_request).collect();
     assert_eq!(

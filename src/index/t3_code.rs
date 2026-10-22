@@ -2,8 +2,8 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 
 use super::{
-    Alias, AliasKind, Artifact, ArtifactKind, Facts, Identity, Lifecycle, Line, Lineage, Message,
-    Parser, Role, Timestamp, Version,
+    Alias, AliasKind, Artifact, ArtifactKind, Cuts, Facts, Identity, Lifecycle, Line, Lineage,
+    Message, Parser, Role, Timestamp, Version,
 };
 use crate::redact;
 
@@ -26,11 +26,11 @@ impl Parser for T3Code {
         })
     }
 
-    fn line(&self, _session: &Identity, _line: &[u8]) -> Line {
+    fn line(&self, _session: &Identity, _line: &[u8], _cuts: Cuts) -> Line {
         Line::default()
     }
 
-    fn version(&self, _session: &Identity, bytes: &[u8]) -> Version {
+    fn version(&self, _session: &Identity, bytes: &[u8], _cuts: Cuts) -> Version {
         let Ok(snapshot) = serde_json::from_slice::<Snapshot>(bytes) else {
             return Version::default();
         };

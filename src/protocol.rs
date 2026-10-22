@@ -9,7 +9,9 @@ use std::io::{self, Read};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::query::{Answer, Ask};
 use crate::raw::{Applied, Sha256, Source, StreamKey, StreamState, Write};
+use crate::{Error, Result};
 
 pub const VERSION: u32 = 1;
 pub const MAX_HEADER_BYTES: u32 = 64 << 20;
@@ -39,14 +41,8 @@ pub enum Request {
         source: Source,
     },
     Write(Write),
-    Find {
-        query: String,
-        limit: usize,
-    },
-    Brief {
-        session: String,
-    },
-    Stats,
+    /// A question any client can ask, answered from the hub's index.
+    Ask(Ask),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -74,6 +70,14 @@ pub enum Response {
     /// The same JSON that `stats --json` prints.
     Stats {
         stats: Value,
+    },
+    /// The same JSON that `read --json` prints.
+    Page {
+        page: Value,
+    },
+    /// The same JSON that `grep --json` prints.
+    Matches {
+        matches: Value,
     },
     /// The hub could not answer. After a protocol violation, it also closes the connection.
     Error {
@@ -103,6 +107,14 @@ enum Header {
         session: String,
     },
     Stats,
+    Read {
+        session: String,
+        page: usize,
+    },
+    Grep {
+        session: String,
+        pattern: String,
+    },
 }
 
 /// A write without its bytes.
@@ -175,20 +187,7 @@ pub fn write_request(out: &mut impl io::Write, request: &Request) -> io::Result<
             }),
             &[],
         ),
-        Request::Find { query, limit } => (
-            Header::Find {
-                query: query.clone(),
-                limit: *limit,
-            },
-            &[],
-        ),
-        Request::Brief { session } => (
-            Header::Brief {
-                session: session.clone(),
-            },
-            &[],
-        ),
-        Request::Stats => (Header::Stats, &[]),
+        Request::Ask(ask) => (ask_header(ask.clone()), &[]),
     };
     write_frame(out, &header, payload)
 }
@@ -232,11 +231,79 @@ pub fn read_request(input: &mut impl Read) -> io::Result<Option<Request>> {
             role,
         },
         Header::State { origin, source } => Request::State { origin, source },
-        Header::Find { query, limit } => Request::Find { query, limit },
-        Header::Brief { session } => Request::Brief { session },
-        Header::Stats => Request::Stats,
+        Header::Find { query, limit } => Request::Ask(Ask::Find { query, limit }),
+        Header::Brief { session } => Request::Ask(Ask::Brief { session }),
+        Header::Stats => Request::Ask(Ask::Stats),
+        Header::Read { session, page } => Request::Ask(Ask::Read { session, page }),
+        Header::Grep { session, pattern } => Request::Ask(Ask::Grep { session, pattern }),
     };
     Ok(Some(request))
+}
+
+fn ask_header(ask: Ask) -> Header {
+    match ask {
+        Ask::Find { query, limit } => Header::Find { query, limit },
+        Ask::Brief { session } => Header::Brief { session },
+        Ask::Stats => Header::Stats,
+        Ask::Read { session, page } => Header::Read { session, page },
+        Ask::Grep { session, pattern } => Header::Grep { session, pattern },
+    }
+}
+
+impl From<Answer> for Response {
+    fn from(answer: Answer) -> Self {
+        let json = |value: serde_json::Result<Value>| value.expect("answers serialize");
+        match answer {
+            Answer::Found(hits) => Response::Found {
+                hits: json(serde_json::to_value(hits)),
+            },
+            Answer::Brief(brief) => Response::Brief {
+                brief: json(serde_json::to_value(brief)),
+            },
+            Answer::Stats(stats) => Response::Stats {
+                stats: json(serde_json::to_value(stats)),
+            },
+            Answer::Page(page) => Response::Page {
+                page: json(serde_json::to_value(page)),
+            },
+            Answer::Matches(matches) => Response::Matches {
+                matches: json(serde_json::to_value(matches)),
+            },
+        }
+    }
+}
+
+impl TryFrom<Response> for Answer {
+    type Error = Error;
+
+    fn try_from(response: Response) -> Result<Self> {
+        let decoded = |error: serde_json::Error| {
+            Error::Io(invalid(format!(
+                "the hub sent an answer that does not decode: {error}"
+            )))
+        };
+        Ok(match response {
+            Response::Found { hits } => {
+                Answer::Found(serde_json::from_value(hits).map_err(decoded)?)
+            }
+            Response::Brief { brief } => {
+                Answer::Brief(serde_json::from_value(brief).map_err(decoded)?)
+            }
+            Response::Stats { stats } => {
+                Answer::Stats(serde_json::from_value(stats).map_err(decoded)?)
+            }
+            Response::Page { page } => Answer::Page(serde_json::from_value(page).map_err(decoded)?),
+            Response::Matches { matches } => {
+                Answer::Matches(serde_json::from_value(matches).map_err(decoded)?)
+            }
+            Response::Error { message } => return Err(Error::Usage(message)),
+            other => {
+                return Err(Error::Io(invalid(format!(
+                    "the hub sent {other:?} instead of an answer"
+                ))));
+            }
+        })
+    }
 }
 
 pub fn write_response(out: &mut impl io::Write, response: &Response) -> io::Result<()> {

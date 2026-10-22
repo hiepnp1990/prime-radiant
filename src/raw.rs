@@ -37,7 +37,7 @@ impl Source {
         }
     }
 
-    fn parse(name: &str) -> Option<Self> {
+    pub fn parse(name: &str) -> Option<Self> {
         match name {
             "claude-code" => Some(Source::ClaudeCode),
             "codex" => Some(Source::Codex),

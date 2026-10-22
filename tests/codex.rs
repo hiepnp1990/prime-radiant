@@ -4,7 +4,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use prime_radiant::collect::{self, import_codex};
-use prime_radiant::index::{self, Indexer, SyncSummary, Timestamp};
+use prime_radiant::index::{self, Cuts, Indexer, SyncSummary, Timestamp};
 use prime_radiant::raw::{RawRef, Sha256, Source, Store, StreamId, View, WriteMode};
 use rusqlite::Connection;
 use serde_json::Value;
@@ -526,7 +526,7 @@ fn fallback_title_is_the_typed_request_and_skips_injected_context() {
             )
             .expect("a rollout names its thread");
         parser
-            .line(&session, line.to_string().as_bytes())
+            .line(&session, line.to_string().as_bytes(), Cuts::INDEX)
             .facts
             .fallback_title
     };

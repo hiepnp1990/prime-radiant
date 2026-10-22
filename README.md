@@ -6,7 +6,7 @@ Today each agent harness keeps its sessions in its own format on the machine whe
 
 ## Status
 
-Prime Radiant is in early development. The repository has the Rust project skeleton and its tests.
+Prime Radiant is in early development. It reads Claude Code, Codex, Grok, and T3 Code sessions, and a hub serves them to the CLI on any machine. A coding agent follows [the skill](skills/prime-radiant/SKILL.md) to find, brief, search, and read past sessions.
 
 ## Design decisions
 

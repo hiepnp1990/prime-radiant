@@ -9,8 +9,9 @@ use std::iter;
 use std::ops::Range;
 use std::path::Path;
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
+use crate::query::{BRIEF_METHOD, Brief};
 use crate::raw::{Progress, RawRef, Sha256, Source, Stream, StreamId, View};
 use crate::redact::{self, Redacted};
 use crate::{Error, Result};
@@ -23,9 +24,9 @@ pub trait Parser {
     /// `first_line` is the first complete line of an append stream, without its newline.
     fn session(&self, locator: &str, first_line: Option<&[u8]>) -> Option<Identity>;
     /// One complete line of a stream of `session`, without its newline.
-    fn line(&self, session: &Identity, line: &[u8]) -> Line;
+    fn line(&self, session: &Identity, line: &[u8], cuts: Cuts) -> Line;
     /// The latest version of a replace stream of `session`.
-    fn version(&self, session: &Identity, bytes: &[u8]) -> Version;
+    fn version(&self, session: &Identity, bytes: &[u8], cuts: Cuts) -> Version;
     /// Another stream that repeats this stream's messages and is read instead whenever the raw layer has it.
     fn superseded_by(&self, _locator: &str) -> Option<String> {
         None
@@ -39,6 +40,26 @@ pub fn parser(source: Source) -> &'static dyn Parser {
         Source::Grok => &grok::Grok,
         Source::T3Code => &t3_code::T3Code,
     }
+}
+
+/// How many characters of each tool call and tool result a parser keeps in a message's text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cuts {
+    pub tool_call: usize,
+    pub tool_result: usize,
+}
+
+impl Cuts {
+    /// For `searchable_text`.
+    pub const INDEX: Cuts = Cuts {
+        tool_call: 500,
+        tool_result: 2000,
+    };
+    /// For `read` and `grep`, which render a message again from its raw bytes.
+    pub const READ: Cuts = Cuts {
+        tool_call: 2000,
+        tool_result: 4000,
+    };
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -247,6 +268,16 @@ impl serde::Serialize for Timestamp {
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         serializer.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Timestamp {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Timestamp::parse_utc(&text)
+            .ok_or_else(|| serde::de::Error::custom(format!("{text} is not a UTC time")))
     }
 }
 
@@ -587,7 +618,7 @@ impl Indexer {
             return Ok(None);
         };
 
-        let (facts, lines) = read_lines(parser, &identity, &bytes[..complete]);
+        let (facts, lines) = read_lines(parser, &identity, &bytes[..complete], Cuts::INDEX);
         let messages: Vec<_> = lines
             .into_iter()
             .map(|(message, range)| {
@@ -647,7 +678,7 @@ impl Indexer {
         let Some(identity) = parser.session(&stream.key.locator, None) else {
             return Ok(None);
         };
-        let version = parser.version(&identity, &self.raw.version(latest_checksum)?);
+        let version = parser.version(&identity, &self.raw.version(latest_checksum)?, Cuts::INDEX);
         let messages: Vec<_> = version
             .messages
             .into_iter()
@@ -702,6 +733,24 @@ impl Indexer {
         )?;
         tx.commit()?;
         Ok(Some(added))
+    }
+
+    /// Stores a brief that a query rebuilt, so the next query reuses it while the session has no newer messages.
+    pub fn store_brief(&mut self, brief: &Brief) -> Result<()> {
+        let body = serde_json::to_string(&brief.body).expect("a brief serializes");
+        self.db.execute(
+            "INSERT INTO briefs (session_key, body, built_through, built_at, method) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (session_key) DO UPDATE SET body = excluded.body, built_through = excluded.built_through,
+                built_at = excluded.built_at, method = excluded.method",
+            params![
+                brief.key,
+                body,
+                brief.freshness.built_through,
+                brief.freshness.built_at.0,
+                BRIEF_METHOD
+            ],
+        )?;
+        Ok(())
     }
 
     /// Removes what a superseded stream indexed, such as before the stream that supersedes it appeared.
@@ -784,11 +833,29 @@ pub fn open_db(dir: &Path) -> Result<Connection> {
     Ok(db)
 }
 
+/// Opens `index.db` in `dir` for reading only. An index built for another schema is an error until the indexer
+/// rebuilds it.
+pub fn open_reader(dir: &Path) -> Result<Connection> {
+    let db = Connection::open_with_flags(
+        dir.join("index.db"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version != SCHEMA_VERSION {
+        return Err(Error::Usage(format!(
+            "{} has an index for another version of prime-radiant; run import again",
+            dir.display()
+        )));
+    }
+    Ok(db)
+}
+
 /// The facts and messages of JSONL `bytes`, each message with the byte range of its line.
 fn read_lines(
     parser: &dyn Parser,
     session: &Identity,
     bytes: &[u8],
+    cuts: Cuts,
 ) -> (Facts, Vec<(Message, Range<u64>)>) {
     let mut facts = Facts::default();
     let mut messages = Vec::new();
@@ -796,7 +863,7 @@ fn read_lines(
     for line in bytes.split(|b| *b == b'\n') {
         let len = line.len() as u64;
         if len > 0 {
-            let parsed = parser.line(session, line);
+            let parsed = parser.line(session, line, cuts);
             facts = facts.then(parsed.facts);
             for message in parsed.messages {
                 messages.push((message, at..at + len));

@@ -1,0 +1,89 @@
+   Compiling todo-cli v0.3.0 (/home/dev/example-project)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.21s
+     Running unittests src/main.rs (target/debug/deps/todo_cli-3f2a9c1d7e8b4a60)
+
+running 64 tests
+test list::tests::renders_item_01 ... ok
+test list::tests::renders_item_02 ... ok
+test list::tests::renders_item_03 ... ok
+test list::tests::renders_item_04 ... ok
+test list::tests::renders_item_05 ... ok
+test list::tests::renders_item_06 ... ok
+test list::tests::renders_item_07 ... ok
+test list::tests::renders_item_08 ... ok
+test list::tests::renders_item_09 ... ok
+test list::tests::renders_item_10 ... ok
+test list::tests::renders_item_11 ... ok
+test list::tests::renders_item_12 ... ok
+test list::tests::renders_item_13 ... ok
+test list::tests::renders_item_14 ... ok
+test list::tests::renders_item_15 ... ok
+test list::tests::renders_item_16 ... ok
+test list::tests::renders_item_17 ... ok
+test list::tests::renders_item_18 ... ok
+test list::tests::renders_item_19 ... ok
+test list::tests::renders_item_20 ... ok
+test list::tests::renders_item_21 ... ok
+test list::tests::renders_item_22 ... ok
+test list::tests::renders_item_23 ... ok
+test list::tests::renders_item_24 ... ok
+test list::tests::renders_item_25 ... ok
+test list::tests::renders_item_26 ... ok
+test list::tests::renders_item_27 ... ok
+test list::tests::renders_item_28 ... ok
+test list::tests::renders_item_29 ... ok
+test list::tests::renders_item_30 ... ok
+test list::tests::renders_item_31 ... ok
+test list::tests::renders_item_32 ... ok
+test list::tests::renders_item_33 ... ok
+test list::tests::renders_item_34 ... ok
+test list::tests::renders_item_35 ... ok
+test list::tests::renders_item_36 ... ok
+test list::tests::renders_item_37 ... ok
+test list::tests::renders_item_38 ... ok
+test list::tests::renders_item_39 ... ok
+test list::tests::renders_item_40 ... ok
+test list::tests::renders_item_41 ... ok
+test list::tests::renders_item_42 ... ok
+test list::tests::renders_item_43 ... ok
+test list::tests::renders_item_44 ... ok
+test list::tests::renders_item_45 ... ok
+test list::tests::renders_item_46 ... ok
+test list::tests::renders_item_47 ... ok
+test list::tests::renders_item_48 ... ok
+test list::tests::renders_item_49 ... ok
+test list::tests::renders_item_50 ... ok
+test list::tests::renders_item_51 ... ok
+test list::tests::renders_item_52 ... ok
+test list::tests::renders_item_53 ... ok
+test list::tests::renders_item_54 ... ok
+test list::tests::renders_item_55 ... ok
+test list::tests::renders_item_56 ... ok
+test list::tests::renders_item_57 ... ok
+test list::tests::renders_item_58 ... ok
+test list::tests::renders_item_59 ... ok
+test list::tests::renders_item_60 ... ok
+test list::tests::json_flag_prints_an_array ... FAILED
+test list::tests::json_flag_escapes_quotes ... FAILED
+test list::tests::json_flag_with_empty_list ... ok
+test list::tests::plain_output_is_unchanged ... ok
+
+failures:
+
+---- list::tests::json_flag_prints_an_array stdout ----
+thread 'list::tests::json_flag_prints_an_array' panicked at src/list.rs:88:9:
+assertion `left == right` failed
+  left: "Buy milk\nWalk the dog\n"
+ right: "[{\"title\":\"Buy milk\",\"done\":false},{\"title\":\"Walk the dog\",\"done\":true}]\n"
+
+---- list::tests::json_flag_escapes_quotes stdout ----
+thread 'list::tests::json_flag_escapes_quotes' panicked at src/list.rs:101:9:
+the --json flag is parsed but never read
+
+failures:
+    list::tests::json_flag_escapes_quotes
+    list::tests::json_flag_prints_an_array
+
+test result: FAILED. 62 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `--bin todo-cli`

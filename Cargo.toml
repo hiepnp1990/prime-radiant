@@ -1,0 +1,16 @@
+[package]
+name = "prime-radiant"
+version = "0.1.0"
+edition = "2024"
+description = "Find and read any past AI session from one always-on hub."
+license = "MIT"
+publish = false
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+notify = "8"
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"

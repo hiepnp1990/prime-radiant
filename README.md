@@ -6,13 +6,24 @@ Today each agent harness keeps its sessions in its own format on the machine whe
 
 ## Status
 
-Prime Radiant is in design. There is no code yet.
+Prime Radiant is in early development. The repository has the Rust project skeleton and its tests.
 
 ## Design decisions
 
 - [0001. Central session store on an always-on hub](docs/decisions/0001-central-session-store.md)
 - [0002. Data model](docs/decisions/0002-data-model.md)
 - [0003. Thin slice](docs/decisions/0003-thin-slice.md)
+
+## Development
+
+Prime Radiant is written in Rust. With the Rust toolchain installed:
+
+```sh
+cargo build
+cargo test
+```
+
+Tests use only made-up example sessions under `tests/fixtures/`.
 
 ## License
 

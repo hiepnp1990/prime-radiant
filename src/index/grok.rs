@@ -185,7 +185,7 @@ impl UpdateLine {
             .params
             .meta
             .agent_timestamp_ms
-            .or(self.timestamp.map(|seconds| seconds * 1000))
+            .or(self.timestamp.and_then(|seconds| seconds.checked_mul(1000)))
             .map(Timestamp);
         let id = self.params.meta.event_id.unwrap_or_else(line_id);
         let mut facts = Facts {

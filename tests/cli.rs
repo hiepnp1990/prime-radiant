@@ -398,7 +398,7 @@ fn stats_has_the_documented_shape_and_a_second_import_keeps_it() {
 }
 
 #[test]
-fn import_reads_codex_and_grok_beside_claude_code_and_needs_a_source() {
+fn import_reads_codex_and_grok_beside_claude_code_and_both_commands_need_a_source() {
     const CODEX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/codex");
     const CODEX_ID: &str = "5f0c2a9e-7d41-4b8a-9e36-1a2b3c4d5e6f";
     const GROK: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/grok");
@@ -430,9 +430,19 @@ fn import_reads_codex_and_grok_beside_claude_code_and_needs_a_source() {
         );
     }
 
-    let output = Command::new(env!("CARGO_BIN_EXE_prime-radiant"))
-        .args(["import", "--data", data, "--origin", "example-origin"])
-        .output()
-        .expect("the built binary runs");
-    assert!(!output.status.success(), "import without a source fails");
+    for command in [
+        ["import", "--data", data],
+        ["collect", "--hub-socket", "hub.sock"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_prime-radiant"))
+            .args(command)
+            .args(["--origin", "example-origin"])
+            .output()
+            .expect("the built binary runs");
+        assert!(
+            !output.status.success(),
+            "{} without a source fails",
+            command[0]
+        );
+    }
 }

@@ -156,7 +156,8 @@ fn append(path: &Path, line: &serde_json::Value) {
 #[test]
 fn scan_keeps_session_files_only() {
     let setup = Setup::new();
-    let found: Vec<(String, WriteMode)> = collect::grok::scan(&setup.root)
+    let found: Vec<(String, WriteMode)> = collect::grok::LAYOUT
+        .scan(&setup.root)
         .expect("scan runs")
         .into_iter()
         .map(|file| (file.locator, file.write_mode))
@@ -436,5 +437,38 @@ fn temporary_files_are_ignored() {
         setup.session(NEW_KEY).1.as_deref(),
         Some("Add a JSON output flag"),
         "the title stays the one in summary.json"
+    );
+}
+
+#[test]
+fn update_with_an_out_of_range_timestamp_is_indexed_without_a_time() {
+    let setup = Setup::new();
+    setup.import();
+    setup.sync();
+    let before = setup.times(OLD_KEY).len();
+    let updates = setup.session_file(PROJECT_FOLDER, OLD_ID, "updates.jsonl");
+    append(
+        &updates,
+        &serde_json::json!({
+            "timestamp": i64::MAX,
+            "method": "session/update",
+            "params": {
+                "sessionId": OLD_ID,
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": "A made-up request about the quokkalantern option."},
+                },
+            },
+        }),
+    );
+    setup.import();
+    setup.sync();
+    let times = setup.times(OLD_KEY);
+    assert_eq!(times.len(), before + 1, "the update is indexed");
+    assert_eq!(times.last(), Some(&None), "without a time");
+    assert_eq!(
+        setup.find("quokkalantern"),
+        [OLD_KEY],
+        "and it is searchable"
     );
 }

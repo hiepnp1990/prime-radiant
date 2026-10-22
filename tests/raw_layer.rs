@@ -98,7 +98,8 @@ fn import(setup: &Setup, store: &mut Store) -> collect::ImportSummary {
 }
 
 fn plan_for(setup: &Setup, store: &Store, locator: &str) -> Vec<Write> {
-    let files: Vec<LocalFile> = claude_code::scan(&setup.root)
+    let files: Vec<LocalFile> = claude_code::LAYOUT
+        .scan(&setup.root)
         .expect("scan runs")
         .into_iter()
         .filter(|file| file.locator == locator)
@@ -119,7 +120,8 @@ fn scan_classifies_transcripts_as_append_and_rewritten_files_as_replace() {
     fs::write(setup.path(&format!("{SESSION}/notes.txt")), "ignored")
         .expect("extra file is written");
 
-    let scanned: Vec<(String, WriteMode)> = claude_code::scan(&setup.root)
+    let scanned: Vec<(String, WriteMode)> = claude_code::LAYOUT
+        .scan(&setup.root)
         .expect("scan runs")
         .into_iter()
         .map(|file| (file.locator, file.write_mode))
@@ -154,7 +156,7 @@ fn import_creates_one_stream_per_file_holding_the_exact_bytes() {
 
     let summary = import(&setup, &mut store);
 
-    let files = claude_code::scan(&setup.root).expect("scan runs");
+    let files = claude_code::LAYOUT.scan(&setup.root).expect("scan runs");
     let states = store.state(ORIGIN).expect("state reads");
     assert_eq!(states.len(), files.len(), "one stream per scanned file");
     assert_eq!(
@@ -424,6 +426,17 @@ fn reapplied_writes_change_nothing_and_bad_segments_are_rejected() {
         Applied::AlreadyHad,
         "re-applying a new generation is a no-op"
     );
+    let skipping = Write::NewGeneration {
+        key: log.clone(),
+        generation: 1 << 40,
+    };
+    assert_eq!(
+        store.apply(&skipping).expect("apply runs"),
+        Applied::Rejected(Rejection::GenerationMismatch { current: 1 }),
+        "a new generation must be the next one"
+    );
+    drop(store);
+    let mut store = Store::open(temp.path()).expect("store reopens");
 
     let title = key("project/session/custom-title.json");
     let version = Write::Version {
@@ -511,7 +524,7 @@ fn append_junk(path: &Path) {
 #[test]
 fn file_deleted_after_the_scan_is_skipped_and_counted() {
     let setup = Setup::new();
-    let files = claude_code::scan(&setup.root).expect("scan runs");
+    let files = claude_code::LAYOUT.scan(&setup.root).expect("scan runs");
     fs::remove_file(setup.path(&main_transcript())).expect("transcript is deleted");
 
     let summary = collect::import(&files, ORIGIN, Source::ClaudeCode, &mut setup.store())

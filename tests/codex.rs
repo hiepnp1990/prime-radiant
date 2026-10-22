@@ -203,7 +203,8 @@ fn scan_keeps_rollouts_only() {
     )
     .expect("finished rollout is archived");
 
-    let scanned: Vec<(String, WriteMode)> = collect::codex::scan(&setup.root)
+    let scanned: Vec<(String, WriteMode)> = collect::codex::LAYOUT
+        .scan(&setup.root)
         .expect("scan runs")
         .into_iter()
         .map(|file| (file.locator, file.write_mode))

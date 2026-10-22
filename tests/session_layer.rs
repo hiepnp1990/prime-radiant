@@ -841,3 +841,87 @@ fn fork_with_rewritten_copies_is_attributed_the_same_when_indexed_before_its_ori
     setup.sync();
     assert_fork_attribution(&setup);
 }
+
+#[test]
+fn timestamp_with_a_non_ascii_fraction_is_skipped_and_sync_goes_on() {
+    let setup = Setup::new();
+    let session = "0a1b2c3d-0000-4000-8000-00000000000e";
+    let line = |uuid: &str, parent: Option<&str>, text: &str, timestamp: &str| {
+        let line = serde_json::json!({
+            "parentUuid": parent,
+            "sessionId": session,
+            "type": "user",
+            "message": {"role": "user", "content": text},
+            "uuid": uuid,
+            "timestamp": timestamp,
+        });
+        format!("{line}\n")
+    };
+    // Byte 3 of the fraction falls inside the two-byte character.
+    let transcript = line(
+        "0a1b2c3d-0000-4000-8000-000000000001",
+        None,
+        "A made-up request about the quokkalantern option.",
+        "2026-01-15T10:00:00.12\u{e9}Z",
+    ) + &line(
+        "0a1b2c3d-0000-4000-8000-000000000002",
+        Some("0a1b2c3d-0000-4000-8000-000000000001"),
+        "A made-up follow-up.",
+        "2026-01-15T10:00:05.000Z",
+    );
+    fs::write(
+        setup
+            .root
+            .join("-home-dev-example-project")
+            .join(format!("{session}.jsonl")),
+        transcript,
+    )
+    .expect("transcript is written");
+
+    setup.import();
+    setup.sync();
+
+    let key = format!("claude-code/{session}");
+    let times = setup
+        .index()
+        .prepare("SELECT at FROM messages WHERE session_key = ?1 ORDER BY position")
+        .expect("time query prepares")
+        .query_map([&key], |row| row.get::<_, Option<i64>>(0))
+        .expect("time query runs")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("times decode");
+    assert_eq!(
+        times,
+        [
+            None,
+            Timestamp::parse_utc("2026-01-15T10:00:05.000Z").map(|at| at.0)
+        ],
+        "the line with the bad timestamp is indexed without a time"
+    );
+    assert_eq!(
+        find_keys(&setup, "quokkalantern"),
+        [key],
+        "the message with the bad timestamp is searchable"
+    );
+    assert_eq!(
+        setup.messages(MAIN_KEY).len(),
+        10,
+        "the stream after it is indexed too"
+    );
+}
+
+#[test]
+fn timestamps_parse_to_the_millisecond_and_bad_fractions_are_rejected() {
+    let at = |text: &str| Timestamp::parse_utc(text).map(|at| at.0);
+    let second = at("2026-01-15T10:00:00Z").expect("a whole second parses");
+    assert_eq!(at("2026-01-15T10:00:00.5Z"), Some(second + 500));
+    assert_eq!(at("2026-01-15T10:00:00.123456Z"), Some(second + 123));
+    for bad in [
+        "2026-01-15T10:00:00.12\u{e9}Z",
+        "2026-01-15T10:00:00.\u{e9}Z",
+        "2026-01-15T10:00:00.1234\u{e9}Z",
+        "2026-01-15T10:00:00.12aZ",
+    ] {
+        assert_eq!(at(bad), None, "{bad} is rejected");
+    }
+}

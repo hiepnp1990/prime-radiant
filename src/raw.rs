@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Seek, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::Digest;
 
 use crate::{Error, Result};
@@ -47,6 +48,21 @@ impl Source {
     }
 }
 
+/// The protocol names a source the way the raw layer stores it.
+impl Serialize for Source {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Source {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Self::parse(&name)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown source {name:?}")))
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Sha256([u8; 32]);
 
@@ -66,6 +82,20 @@ impl Sha256 {
     }
 }
 
+impl Serialize for Sha256 {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for Sha256 {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let hex = String::deserialize(deserializer)?;
+        Self::from_hex(&hex)
+            .ok_or_else(|| serde::de::Error::custom("expected 64 hex digits of a SHA-256"))
+    }
+}
+
 impl fmt::Debug for Sha256 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Sha256({})", self.to_hex())
@@ -73,7 +103,7 @@ impl fmt::Debug for Sha256 {
 }
 
 /// The SHA-256 and length of the first `min(HEAD_LEN, confirmed_offset)` bytes of an append stream.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeadCheck {
     pub len: u64,
     pub sha256: Sha256,
@@ -88,7 +118,7 @@ impl HeadCheck {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StreamKey {
     pub origin: String,
     pub source: Source,
@@ -116,13 +146,14 @@ pub struct RawRef {
     pub end: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamState {
     pub generation: u64,
     pub progress: Progress,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Progress {
     Append {
         confirmed_offset: u64,
@@ -180,7 +211,8 @@ impl Write {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Applied {
     Appended { confirmed_offset: u64 },
     AlreadyHad,
@@ -190,7 +222,8 @@ pub enum Applied {
     NewGenerationStarted { generation: u64 },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Rejection {
     Gap { confirmed_offset: u64 },
     Overlap { confirmed_offset: u64 },
@@ -309,16 +342,33 @@ impl StreamRow {
     }
 }
 
-/// The only writer of the raw layer.
+/// The only writer of the raw layer. It holds a lock on `raw.lock`, so a second `Store` on the same directory, in
+/// any process, fails to open instead of trimming bytes the first one is still writing.
 pub struct Store {
     dir: PathBuf,
     db: Connection,
+    _lock: File,
 }
 
 impl Store {
     pub fn open(dir: &Path) -> Result<Self> {
         fs::create_dir_all(dir.join("streams"))?;
         fs::create_dir_all(dir.join("blobs"))?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join("raw.lock"))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(Error::Usage(format!(
+                    "another process is writing {}; is a hub serving it?",
+                    dir.display()
+                )));
+            }
+            Err(TryLockError::Error(error)) => return Err(error.into()),
+        }
         let db = Connection::open(dir.join("raw.db"))?;
         db.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
         db.pragma_update(None, "synchronous", "FULL")?;
@@ -327,6 +377,7 @@ impl Store {
         let store = Self {
             dir: dir.to_owned(),
             db,
+            _lock: lock,
         };
         store.trim_uncommitted()?;
         Ok(store)
@@ -344,6 +395,11 @@ impl Store {
             Write::Version { key, sha256, bytes } => self.apply_version(key, *sha256, bytes),
             Write::NewGeneration { key, generation } => self.apply_new_generation(key, *generation),
         }
+    }
+
+    /// One stream's confirmed state, or `None` if the stream does not exist.
+    pub fn stream_state(&self, key: &StreamKey) -> Result<Option<StreamState>> {
+        Ok(self.find(key)?.map(|(_, state)| state))
     }
 
     pub fn state(&self, origin: &str) -> Result<HashMap<StreamKey, StreamState>> {
@@ -442,10 +498,10 @@ impl Store {
                 current: state.generation,
             }));
         }
-        let end = start + bytes.len() as u64;
         if start > confirmed_offset {
             return Ok(Applied::Rejected(Rejection::Gap { confirmed_offset }));
         }
+        let end = start + bytes.len() as u64;
         if start < confirmed_offset {
             if end > confirmed_offset {
                 return Ok(Applied::Rejected(Rejection::Overlap { confirmed_offset }));
@@ -552,6 +608,12 @@ impl Store {
         }
         if generation <= state.generation {
             return Ok(Applied::AlreadyHad);
+        }
+        // Generations count up by one, which keeps the trim at open proportional to the rewrites that happened.
+        if generation != state.generation + 1 {
+            return Ok(Applied::Rejected(Rejection::GenerationMismatch {
+                current: state.generation,
+            }));
         }
         let id = match id {
             Some(id) => id,

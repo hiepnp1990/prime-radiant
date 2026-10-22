@@ -1,9 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+use prime_radiant::collect::live::{self, HubAddress};
 use prime_radiant::collect::{import_claude_code, import_codex, import_grok, import_t3_code};
+use prime_radiant::hub;
 use prime_radiant::index::{Indexer, Timestamp};
 use prime_radiant::query::{Brief, Hit, Query, Stats};
 use prime_radiant::raw::{Source, Store};
@@ -26,25 +28,14 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Import Claude Code, Codex, Grok, and T3 Code sessions into the raw layer, then index them.
-    #[command(group(clap::ArgGroup::new("sources").required(true).multiple(true)))]
     Import {
         #[arg(long)]
         data: PathBuf,
         /// The machine or account the files come from.
         #[arg(long)]
         origin: String,
-        /// A Claude Code projects folder, such as ~/.claude/projects.
-        #[arg(long = "claude-code", group = "sources")]
-        claude_code: Vec<PathBuf>,
-        /// A Codex home folder, such as ~/.codex.
-        #[arg(long, group = "sources")]
-        codex: Vec<PathBuf>,
-        /// A Grok home folder, such as ~/.grok.
-        #[arg(long, group = "sources")]
-        grok: Vec<PathBuf>,
-        /// A T3 Code database, such as ~/.t3/userdata/statev2.sqlite. It is only read.
-        #[arg(long = "t3-code", value_name = "DATABASE", group = "sources")]
-        t3_code: Vec<PathBuf>,
+        #[command(flatten)]
+        sources: Sources,
     },
     /// Count what the store holds, and list every stream and session.
     Stats {
@@ -73,6 +64,78 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Run the hub, or reach it from another machine.
+    Hub {
+        #[command(subcommand)]
+        command: HubCommand,
+    },
+    /// Send Claude Code, Codex, Grok, and T3 Code sessions to a hub as they change, and keep running.
+    Collect {
+        /// The machine or account the files come from.
+        #[arg(long)]
+        origin: String,
+        #[command(flatten)]
+        sources: Sources,
+        #[command(flatten)]
+        hub: HubArgs,
+        /// How often to rescan every source for changes the file watcher missed.
+        #[arg(long, default_value_t = 300)]
+        sweep_seconds: u64,
+    },
+}
+
+/// Where the sessions are. Each flag repeats, and at least one is required.
+#[derive(Args)]
+#[group(required = true, multiple = true)]
+struct Sources {
+    /// A Claude Code projects folder, such as ~/.claude/projects.
+    #[arg(long = "claude-code")]
+    claude_code: Vec<PathBuf>,
+    /// A Codex home folder, such as ~/.codex.
+    #[arg(long)]
+    codex: Vec<PathBuf>,
+    /// A Grok home folder, such as ~/.grok.
+    #[arg(long)]
+    grok: Vec<PathBuf>,
+    /// A T3 Code database, such as ~/.t3/userdata/statev2.sqlite. It is only read.
+    #[arg(long = "t3-code", value_name = "DATABASE")]
+    t3_code: Vec<PathBuf>,
+}
+
+impl Sources {
+    fn into_list(self) -> Vec<(Source, PathBuf)> {
+        let tag = |source, paths: Vec<PathBuf>| paths.into_iter().map(move |path| (source, path));
+        tag(Source::ClaudeCode, self.claude_code)
+            .chain(tag(Source::Codex, self.codex))
+            .chain(tag(Source::Grok, self.grok))
+            .chain(tag(Source::T3Code, self.t3_code))
+            .collect()
+    }
+}
+
+#[derive(Subcommand)]
+enum HubCommand {
+    /// Serve a data directory on <data>/hub.sock, as the only writer of its raw layer and index.
+    Serve {
+        #[arg(long)]
+        data: PathBuf,
+    },
+    /// Copy stdin to the hub's socket and the socket to stdout, for a collector that runs it over SSH.
+    Connect {
+        #[arg(long)]
+        data: PathBuf,
+    },
+}
+
+#[derive(Args)]
+#[group(required = true, multiple = false)]
+struct HubArgs {
+    /// The hub's socket on this machine, <data>/hub.sock.
+    #[arg(long)]
+    hub_socket: Option<PathBuf>,
+    /// A command whose stdin and stdout reach the hub, such as "ssh <host> prime-radiant hub connect --data <dir>".
+    #[arg(long)]
+    hub_command: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -90,19 +153,8 @@ fn run(command: Command) -> prime_radiant::Result<()> {
         Command::Import {
             data,
             origin,
-            claude_code,
-            codex,
-            grok,
-            t3_code,
-        } => {
-            let sources = claude_code
-                .into_iter()
-                .map(|path| (Source::ClaudeCode, path))
-                .chain(codex.into_iter().map(|path| (Source::Codex, path)))
-                .chain(grok.into_iter().map(|path| (Source::Grok, path)))
-                .chain(t3_code.into_iter().map(|path| (Source::T3Code, path)));
-            import(&data, &origin, sources)
-        }
+            sources,
+        } => import(&data, &origin, sources.into_list()),
         Command::Stats { data, json } => {
             let stats = Query::open(&data, now())?.stats()?;
             if json {
@@ -139,14 +191,31 @@ fn run(command: Command) -> prime_radiant::Result<()> {
             }
             Ok(())
         }
+        Command::Hub {
+            command: HubCommand::Serve { data },
+        } => hub::serve(&data),
+        Command::Hub {
+            command: HubCommand::Connect { data },
+        } => Ok(hub::connect(&data)?),
+        Command::Collect {
+            origin,
+            sources,
+            hub,
+            sweep_seconds,
+        } => live::run(live::Options {
+            origin,
+            sources: sources.into_list(),
+            hub: match (hub.hub_socket, hub.hub_command) {
+                (Some(socket), _) => HubAddress::Socket(socket),
+                (None, Some(command)) => HubAddress::Command(command),
+                (None, None) => unreachable!("clap requires one of the hub flags"),
+            },
+            sweep: Duration::from_secs(sweep_seconds),
+        }),
     }
 }
 
-fn import(
-    data: &Path,
-    origin: &str,
-    sources: impl Iterator<Item = (Source, PathBuf)>,
-) -> prime_radiant::Result<()> {
+fn import(data: &Path, origin: &str, sources: Vec<(Source, PathBuf)>) -> prime_radiant::Result<()> {
     let mut store = Store::open(data)?;
     for (source, path) in sources {
         let (summary, unit) = match source {

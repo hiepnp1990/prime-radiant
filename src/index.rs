@@ -5,6 +5,7 @@ pub mod t3_code;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::iter;
 use std::ops::Range;
 use std::path::Path;
 
@@ -224,16 +225,15 @@ impl Timestamp {
             || hour > 23
             || minute > 59
             || second > 60
+            || !fraction.bytes().all(|b| b.is_ascii_digit())
         {
             return None;
         }
-        let millis = match fraction {
-            "" => 0,
-            digits => {
-                let digits = &digits[..digits.len().min(3)];
-                number(digits, digits.len())? * 10_i64.pow(3 - digits.len() as u32)
-            }
-        };
+        let millis = fraction
+            .bytes()
+            .chain(iter::repeat(b'0'))
+            .take(3)
+            .fold(0, |millis, digit| millis * 10 + i64::from(digit - b'0'));
         let days = days_from_civil(year, month, day);
         Some(Self(
             ((days * 24 + hour) * 60 + minute) * 60_000 + second * 1000 + millis,

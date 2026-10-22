@@ -659,3 +659,49 @@ fn secret_in_a_transcript_is_redacted_from_searchable_text() {
         "full-text search cannot find the token"
     );
 }
+
+#[test]
+fn flat_subagent_transcript_joins_the_session_named_on_its_lines() {
+    let setup = Setup::new();
+    let project = setup.root.join("-home-dev-example-project");
+    let flat = project.join(format!("agent-{AGENT_ID}.jsonl"));
+    fs::rename(setup.subagent_transcript(), &flat).expect("transcript moves beside the main one");
+    fs::remove_dir_all(project.join(SESSION_ID).join("subagents"))
+        .expect("subagents folder is removed");
+    let sessions = |setup: &Setup| {
+        setup.strings(
+            "SELECT key || ' ' || kind || ' ' || COALESCE(parent_key, '-') || ' ' || message_count
+             FROM sessions WHERE ?1 = ?1 ORDER BY key",
+            "",
+        )
+    };
+
+    setup.import();
+    setup.sync();
+    assert_eq!(
+        sessions(&setup),
+        [
+            format!("{MAIN_KEY} main - 10"),
+            format!("{SUBAGENT_KEY} subagent {MAIN_KEY} 6"),
+        ],
+        "the flat transcript is a subagent of the session on its lines, not a main session"
+    );
+
+    let (order, _) = lines_by_uuid(&flat);
+    let line = user_line(
+        "4b1d2a6e-0000-4000-8000-000000000004",
+        order.last().expect("transcript has messages"),
+        "Also check the show command.",
+    );
+    append(&flat, line.as_bytes());
+    setup.import();
+    setup.sync();
+    assert_eq!(
+        sessions(&setup),
+        [
+            format!("{MAIN_KEY} main - 10"),
+            format!("{SUBAGENT_KEY} subagent {MAIN_KEY} 7"),
+        ],
+        "a line appended later joins the same subagent"
+    );
+}

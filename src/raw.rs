@@ -647,6 +647,19 @@ impl View {
     pub fn version(&self, sha256: Sha256) -> Result<Vec<u8>> {
         Ok(fs::read(blob_path(&self.dir, sha256))?)
     }
+
+    /// Row counts of streams, segments, and versions.
+    pub fn counts(&self) -> Result<[(&'static str, u64); 3]> {
+        let count = |table: &'static str| -> Result<(&'static str, u64)> {
+            let n: i64 =
+                self.db
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })?;
+            Ok((table, n as u64))
+        };
+        Ok([count("streams")?, count("segments")?, count("versions")?])
+    }
 }
 
 fn read_log(dir: &Path, id: i64, generation: u64, start: u64, end: u64) -> Result<Vec<u8>> {

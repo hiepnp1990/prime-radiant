@@ -27,10 +27,20 @@ static PULL_REQUEST: LazyLock<Regex> = LazyLock::new(|| {
 pub struct ClaudeCode;
 
 impl Parser for ClaudeCode {
-    fn session(&self, locator: &str) -> Option<Identity> {
+    fn session(&self, locator: &str, first_line: Option<&[u8]>) -> Option<Identity> {
         let parts: Vec<&str> = locator.split('/').collect();
         match parts.as_slice() {
-            [_, file] => file.strip_suffix(".jsonl").map(main),
+            [_, file] => {
+                let stem = file.strip_suffix(".jsonl")?;
+                match stem.strip_prefix("agent-") {
+                    // A subagent transcript beside the main ones names its parent session only on its lines.
+                    Some(agent) => {
+                        let line: RawLine = serde_json::from_slice(first_line?).ok()?;
+                        Some(subagent(&line.session_id?, agent))
+                    }
+                    None => Some(main(stem)),
+                }
+            }
             [_, session, "custom-title.json"] => Some(main(session)),
             [_, session, "subagents", file] => {
                 let agent = file
@@ -48,7 +58,7 @@ impl Parser for ClaudeCode {
             return Line::default();
         };
         let facts = Facts {
-            title: line.custom_title.clone(),
+            title: line.custom_title.clone().or_else(|| line.ai_title.clone()),
             project: line.cwd.clone(),
         };
         let message = line.uuid.clone().map(|id| message(id, line));
@@ -109,9 +119,13 @@ struct RawLine {
     kind: String,
     uuid: Option<String>,
     parent_uuid: Option<String>,
+    session_id: Option<String>,
+    #[serde(default)]
+    is_meta: bool,
     timestamp: Option<String>,
     cwd: Option<String>,
     custom_title: Option<String>,
+    ai_title: Option<String>,
     message: Option<RawMessage>,
     attachment: Option<RawAttachment>,
     content: Option<Content>,
@@ -183,7 +197,7 @@ fn message(id: String, line: RawLine) -> Message {
     Message {
         id,
         parent_id: line.parent_uuid,
-        role: role(&line.kind, content.as_ref()),
+        role: role(&line.kind, line.is_meta, content.as_ref()),
         at: line.timestamp.as_deref().and_then(Timestamp::parse_utc),
         searchable_text: found.pieces.join("\n"),
         artifacts: found.artifacts,
@@ -191,7 +205,7 @@ fn message(id: String, line: RawLine) -> Message {
     }
 }
 
-fn role(kind: &str, content: Option<&Content>) -> Role {
+fn role(kind: &str, is_meta: bool, content: Option<&Content>) -> Role {
     let blocks = match content {
         Some(Content::Blocks(blocks)) => blocks.as_slice(),
         _ => &[],
@@ -199,6 +213,8 @@ fn role(kind: &str, content: Option<&Content>) -> Role {
     let has = |wanted: fn(&Block) -> bool| blocks.iter().any(wanted);
     match kind {
         "user" if has(|block| matches!(block, Block::ToolResult { .. })) => Role::ToolResult,
+        // Claude Code marks text it injects into the user's turn, such as skill bodies and command caveats.
+        "user" if is_meta => Role::System,
         "user" => Role::User,
         "assistant"
             if !has(|block| matches!(block, Block::Text { .. }))

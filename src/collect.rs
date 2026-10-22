@@ -23,6 +23,8 @@ pub struct LocalFile {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ImportSummary {
     pub files_scanned: usize,
+    /// Files deleted between the scan and the read. Claude Code deletes old transcripts.
+    pub files_vanished: usize,
     pub writes_planned: usize,
     pub bytes_appended: u64,
     pub versions_stored: usize,
@@ -127,14 +129,31 @@ fn plan_replace(
 }
 
 pub fn import_claude_code(root: &Path, origin: &str, store: &mut Store) -> Result<ImportSummary> {
-    let files = claude_code::scan(root)?;
+    import(&claude_code::scan(root)?, origin, Source::ClaudeCode, store)
+}
+
+/// Imports the files a scan found. A file deleted since the scan is skipped and counted.
+pub fn import(
+    files: &[LocalFile],
+    origin: &str,
+    source: Source,
+    store: &mut Store,
+) -> Result<ImportSummary> {
     let states = store.state(origin)?;
     let mut summary = ImportSummary {
         files_scanned: files.len(),
         ..ImportSummary::default()
     };
-    for file in &files {
-        for write in plan(origin, Source::ClaudeCode, file, &states)? {
+    for file in files {
+        let writes = match plan(origin, source, file, &states) {
+            Ok(writes) => writes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                summary.files_vanished += 1;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        for write in writes {
             summary.writes_planned += 1;
             match store.apply(&write)? {
                 Applied::Appended { .. } => {

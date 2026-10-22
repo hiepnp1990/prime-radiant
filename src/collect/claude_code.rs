@@ -14,10 +14,17 @@ pub fn scan(root: &Path) -> io::Result<Vec<LocalFile>> {
 }
 
 fn visit(root: &Path, dir: &Path, files: &mut Vec<LocalFile>) -> io::Result<()> {
-    for entry in fs::read_dir(dir)? {
+    let entries = match fs::read_dir(dir) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound && dir != root => return Ok(()),
+        entries => entries?,
+    };
+    for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        let kind = entry.file_type()?;
+        let kind = match entry.file_type() {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            kind => kind?,
+        };
         if kind.is_dir() {
             visit(root, &path, files)?;
             continue;

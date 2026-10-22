@@ -1,0 +1,675 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
+use std::sync::LazyLock;
+
+use regex::Regex;
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
+
+use crate::index::{self, Timestamp};
+use crate::raw::{Progress, View};
+use crate::redact;
+use crate::{Error, Result};
+
+const LIVE_WINDOW_MS: i64 = 10 * 60 * 1000;
+const MIN_ID_PREFIX: usize = 8;
+/// How many of a term's best messages count toward session scores. A term common enough to pass this adds little anyway.
+const MESSAGES_PER_TERM: i64 = 5000;
+const TITLE_WEIGHT: f64 = 3.0;
+const SNIPPET_TOKENS: i64 = 24;
+
+const FIRST_REQUEST_CHARS: usize = 600;
+const LAST_ANSWER_CHARS: usize = 1200;
+const CHANGED_FILES: usize = 20;
+const BRIEF_METHOD: &str = "extractive-1";
+
+const STOP_WORDS: &str = "\
+    a about above after again against all am an and any are as at be because been before \
+    being below between both but by can could did do does doing down during each few for \
+    from further had has have having he her here hers herself him himself his how i if in \
+    into is it its itself just me more most my myself no nor not now of off on once only or \
+    other our ours ourselves out over own same she should so some such than that the their \
+    theirs them themselves then there these they this those through to too under until up \
+    very was we were what when where which while who whom why will with would you your yours \
+    yourself yourselves";
+
+static SYSTEM_REMINDER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)<system-reminder>.*?(?:</system-reminder>|\z)")
+        .expect("system reminder pattern compiles")
+});
+/// The tags Claude Code wraps around a slash command, which a brief shows as `/name args`.
+static COMMAND: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?s)<command-message>.*?</command-message>\s*<command-name>(?P<name>.*?)</command-name>\s*(?:<command-args>(?P<args>.*?)</command-args>)?",
+    )
+    .expect("command pattern compiles")
+});
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum State {
+    Live,
+    Idle,
+}
+
+impl State {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            State::Live => "live",
+            State::Idle => "idle",
+        }
+    }
+
+    pub fn of(last_activity: Option<Timestamp>, now: Timestamp) -> Self {
+        match last_activity {
+            Some(at) if now.0 - at.0 < LIVE_WINDOW_MS => State::Live,
+            _ => State::Idle,
+        }
+    }
+}
+
+/// One `find` candidate. `score` and `snippet` are `None` when the query was an ID.
+#[derive(Clone, Debug, Serialize)]
+pub struct Hit {
+    pub key: String,
+    pub title: Option<String>,
+    pub project: Option<String>,
+    pub ran_on: String,
+    pub last_activity: Option<Timestamp>,
+    pub state: State,
+    pub score: Option<f64>,
+    pub snippet: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Brief {
+    pub key: String,
+    pub title: Option<String>,
+    pub project: Option<String>,
+    pub origin: String,
+    pub parent: Option<String>,
+    pub started: Option<Timestamp>,
+    pub last_activity: Option<Timestamp>,
+    pub state: State,
+    /// Message counts by role, plus `total`.
+    pub messages: BTreeMap<String, u64>,
+    #[serde(flatten)]
+    pub body: BriefBody,
+    pub freshness: Freshness,
+}
+
+/// The extracted part of a brief, stored in `briefs` and rebuilt when the session has newer messages.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BriefBody {
+    pub first_request: Option<String>,
+    pub last_answer: Option<String>,
+    pub pull_requests: Vec<String>,
+    pub changed_files: Vec<String>,
+    pub changed_files_total: usize,
+    pub subagents: Vec<Subagent>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Subagent {
+    pub key: String,
+    pub title: Option<String>,
+    pub message_count: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Freshness {
+    /// The last message position the brief covers.
+    pub built_through: Option<i64>,
+    pub built_at: Timestamp,
+    /// Whether this call rebuilt the brief because the session had newer messages.
+    pub rebuilt: bool,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+pub struct Stats {
+    pub counts: Counts,
+    pub streams: Vec<StreamStats>,
+    pub sessions: Vec<SessionStats>,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+pub struct Counts {
+    pub streams: u64,
+    pub segments: u64,
+    pub versions: u64,
+    pub sessions: u64,
+    pub messages: u64,
+    pub aliases: u64,
+    pub media: u64,
+    pub artifacts: u64,
+}
+
+/// `offset` is set for append streams and `checksum` for replace streams.
+#[derive(Debug, PartialEq, Serialize)]
+pub struct StreamStats {
+    pub locator: String,
+    pub generation: u64,
+    pub offset: Option<u64>,
+    pub checksum: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+pub struct SessionStats {
+    pub key: String,
+    pub message_count: u64,
+}
+
+/// Answers `find`, `brief`, and `stats` from a data directory. Writes only the `briefs` table.
+pub struct Query {
+    dir: std::path::PathBuf,
+    db: Connection,
+    now: Timestamp,
+}
+
+impl Query {
+    pub fn open(dir: &Path, now: Timestamp) -> Result<Self> {
+        if !dir.join("index.db").is_file() {
+            return Err(Error::Usage(format!(
+                "{} has no index; run import first",
+                dir.display()
+            )));
+        }
+        Ok(Self {
+            dir: dir.to_owned(),
+            db: index::open_db(dir)?,
+            now,
+        })
+    }
+
+    /// An exact key or alias wins, then a unique ID prefix, then full-text search.
+    pub fn find(&self, query: &str, limit: usize) -> Result<Vec<Hit>> {
+        let keys = self.resolve(query)?;
+        if keys.is_empty() {
+            return self.search(query, limit);
+        }
+        keys.iter()
+            .take(limit)
+            .map(|key| self.hit(key, None, None))
+            .collect()
+    }
+
+    pub fn brief(&self, session: &str) -> Result<Brief> {
+        let key = match self.resolve(session)?.as_slice() {
+            [key] => key.clone(),
+            [] => return Err(Error::Usage(format!("no session matches {session}"))),
+            several => {
+                return Err(Error::Usage(format!(
+                    "{session} matches {} sessions: {}",
+                    several.len(),
+                    several.join(", ")
+                )));
+            }
+        };
+        let (title, project, origin, parent, started, last_activity) = self.db.query_row(
+            "SELECT title, project, ran_on, parent_key, started_at, last_activity FROM sessions WHERE key = ?1",
+            [&key],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?.map(Timestamp),
+                    row.get::<_, Option<i64>>(5)?.map(Timestamp),
+                ))
+            },
+        )?;
+        let (body, freshness) = self.brief_body(&key)?;
+        Ok(Brief {
+            messages: self.role_counts(&key)?,
+            state: State::of(last_activity, self.now),
+            key,
+            title,
+            project,
+            origin,
+            parent,
+            started,
+            last_activity,
+            body,
+            freshness,
+        })
+    }
+
+    /// The sessions an ID names, best first. Empty when the input is not an ID.
+    fn resolve(&self, input: &str) -> Result<Vec<String>> {
+        let input = input.trim();
+        let exact: Option<String> = self
+            .db
+            .query_row(
+                "SELECT key FROM sessions WHERE key = ?1
+                 UNION ALL SELECT session_key FROM aliases WHERE value = ?1 LIMIT 1",
+                [input],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(key) = exact {
+            return Ok(vec![key]);
+        }
+        let Some(prefix) = id_prefix(input) else {
+            return Ok(Vec::new());
+        };
+        let mut query = self.db.prepare(
+            "SELECT DISTINCT s.key, s.parent_key FROM aliases a JOIN sessions s ON s.key = a.session_key
+             WHERE substr(a.value, 1, length(?1)) = ?1
+             ORDER BY s.last_activity DESC, s.key",
+        )?;
+        let matches = query
+            .query_map([&prefix], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let keys: HashSet<&str> = matches.iter().map(|(key, _)| key.as_str()).collect();
+        // A main session's ID prefix also prefixes its subagents' IDs, which should not make it ambiguous.
+        Ok(matches
+            .iter()
+            .filter(|(_, parent)| !parent.as_deref().is_some_and(|p| keys.contains(p)))
+            .map(|(key, _)| key.clone())
+            .collect())
+    }
+
+    fn search(&self, query: &str, limit: usize) -> Result<Vec<Hit>> {
+        let terms = terms(query);
+        if terms.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let main_of = self.main_sessions()?;
+        let main = |key: String| main_of.get(&key).cloned().unwrap_or(key);
+        let main_count: i64 = self.db.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE parent_key IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+
+        // Per main session, the best score of each term in any of its messages or titles.
+        let mut term_scores: HashMap<String, Vec<f64>> = HashMap::new();
+        let mut idf = Vec::with_capacity(terms.len());
+        let mut sessions_with = self.db.prepare(
+            "SELECT DISTINCT session_key FROM message_search WHERE message_search MATCH ?1",
+        )?;
+        let mut message_scores: HashMap<i64, (String, f64)> = HashMap::new();
+        let mut messages = self.db.prepare(
+            "SELECT rowid, session_key, -bm25(message_search) FROM message_search
+             WHERE message_search MATCH ?1 ORDER BY rank LIMIT ?2",
+        )?;
+        let mut titles = self.db.prepare(
+            "SELECT key, -bm25(title_search) FROM title_search WHERE title_search MATCH ?1",
+        )?;
+        for (i, term) in terms.iter().enumerate() {
+            let phrase = phrase(term);
+            let rows = messages
+                .query_map(params![phrase, MESSAGES_PER_TERM], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get(2)?))
+                })?
+                .collect::<rusqlite::Result<Vec<(i64, String, f64)>>>()?;
+            for (rowid, session, score) in rows {
+                let session = main(session);
+                let best = &mut term_scores
+                    .entry(session.clone())
+                    .or_insert_with(|| vec![0.0; terms.len()])[i];
+                *best = best.max(score);
+                message_scores.entry(rowid).or_insert((session, 0.0)).1 += score;
+            }
+            let rows = titles
+                .query_map([&phrase], |row| Ok((row.get::<_, String>(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<(String, f64)>>>()?;
+            let mut matched: HashSet<String> = sessions_with
+                .query_map([&phrase], |row| row.get(0))?
+                .map(|key| key.map(main))
+                .collect::<rusqlite::Result<_>>()?;
+            for (session, score) in rows {
+                let session = main(session);
+                term_scores
+                    .entry(session.clone())
+                    .or_insert_with(|| vec![0.0; terms.len()])[i] += TITLE_WEIGHT * score;
+                matched.insert(session);
+            }
+            idf.push(session_idf(main_count, matched.len()));
+        }
+
+        let last_activity = self.last_activity()?;
+        let mut ranked: Vec<(String, f64)> = term_scores
+            .into_iter()
+            .map(|(session, scores)| {
+                let score = scores.iter().zip(&idf).map(|(s, w)| s * w).sum();
+                (session, score)
+            })
+            .collect();
+        ranked.sort_by(|a, b| {
+            b.1.total_cmp(&a.1)
+                .then_with(|| last_activity.get(&b.0).cmp(&last_activity.get(&a.0)))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        ranked.truncate(limit);
+
+        let mut best_message: HashMap<&str, (i64, f64)> = HashMap::new();
+        for (rowid, (session, score)) in &message_scores {
+            let best = best_message.entry(session).or_insert((*rowid, *score));
+            if *score > best.1 || (*score == best.1 && *rowid < best.0) {
+                *best = (*rowid, *score);
+            }
+        }
+        let any_term = terms
+            .iter()
+            .map(|t| phrase(t))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        ranked
+            .iter()
+            .map(|(session, score)| {
+                let snippet = match best_message.get(session.as_str()) {
+                    Some((rowid, _)) => self.snippet(&any_term, *rowid)?,
+                    None => None,
+                };
+                self.hit(session, Some(*score), snippet)
+            })
+            .collect()
+    }
+
+    /// Maps each subagent session to its main session.
+    fn main_sessions(&self) -> Result<HashMap<String, String>> {
+        let mut query = self
+            .db
+            .prepare("SELECT key, parent_key FROM sessions WHERE parent_key IS NOT NULL")?;
+        let rows = query
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<HashMap<String, String>>>()?;
+        Ok(rows)
+    }
+
+    fn last_activity(&self) -> Result<HashMap<String, i64>> {
+        let mut query = self
+            .db
+            .prepare("SELECT key, last_activity FROM sessions WHERE last_activity IS NOT NULL")?;
+        let rows = query
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    fn snippet(&self, any_term: &str, rowid: i64) -> Result<Option<String>> {
+        let snippet: Option<String> = self
+            .db
+            .query_row(
+                "SELECT snippet(message_search, 0, '**', '**', '...', ?3) FROM message_search
+                 WHERE message_search MATCH ?1 AND rowid = ?2",
+                params![any_term, rowid, SNIPPET_TOKENS],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(snippet.map(|text| {
+            let text = redact::secrets(&text).into_string();
+            text.split_whitespace().collect::<Vec<_>>().join(" ")
+        }))
+    }
+
+    fn hit(&self, key: &str, score: Option<f64>, snippet: Option<String>) -> Result<Hit> {
+        let (title, project, ran_on, last_activity) = self.db.query_row(
+            "SELECT title, project, ran_on, last_activity FROM sessions WHERE key = ?1",
+            [key],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get::<_, Option<i64>>(3)?.map(Timestamp),
+                ))
+            },
+        )?;
+        Ok(Hit {
+            key: key.to_owned(),
+            title,
+            project,
+            ran_on,
+            last_activity,
+            state: State::of(last_activity, self.now),
+            score,
+            snippet,
+        })
+    }
+
+    fn role_counts(&self, key: &str) -> Result<BTreeMap<String, u64>> {
+        let mut query = self.db.prepare(
+            "SELECT role, COUNT(*) FROM messages WHERE session_key = ?1 GROUP BY role ORDER BY role",
+        )?;
+        let mut counts = query
+            .query_map([key], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?
+            .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
+        let total = counts.values().sum();
+        counts.insert("total".to_owned(), total);
+        Ok(counts)
+    }
+
+    fn brief_body(&self, key: &str) -> Result<(BriefBody, Freshness)> {
+        let latest: Option<i64> = self.db.query_row(
+            "SELECT MAX(position) FROM messages WHERE session_key = ?1",
+            [key],
+            |row| row.get(0),
+        )?;
+        let stored: Option<(String, Option<i64>, i64)> = self
+            .db
+            .query_row(
+                "SELECT body, built_through, built_at FROM briefs WHERE session_key = ?1 AND method = ?2",
+                params![key, BRIEF_METHOD],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((body, built_through, built_at)) = stored
+            && built_through == latest
+            && let Ok(body) = serde_json::from_str(&body)
+        {
+            let freshness = Freshness {
+                built_through,
+                built_at: Timestamp(built_at),
+                rebuilt: false,
+            };
+            return Ok((body, freshness));
+        }
+        let body = self.extract(key)?;
+        let json = serde_json::to_string(&body).expect("a brief serializes");
+        self.db.execute(
+            "INSERT INTO briefs (session_key, body, built_through, built_at, method) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (session_key) DO UPDATE SET body = excluded.body, built_through = excluded.built_through,
+                built_at = excluded.built_at, method = excluded.method",
+            params![key, json, latest, self.now.0, BRIEF_METHOD],
+        )?;
+        let freshness = Freshness {
+            built_through: latest,
+            built_at: self.now,
+            rebuilt: true,
+        };
+        Ok((body, freshness))
+    }
+
+    fn extract(&self, key: &str) -> Result<BriefBody> {
+        let first_request = self.first_text(
+            "SELECT searchable_text FROM messages WHERE session_key = ?1 AND role = 'user' ORDER BY position",
+            key,
+            FIRST_REQUEST_CHARS,
+        )?;
+        let last_answer = self.first_text(
+            "SELECT searchable_text FROM messages WHERE session_key = ?1 AND role = 'assistant' ORDER BY position DESC",
+            key,
+            LAST_ANSWER_CHARS,
+        )?;
+
+        let mut query = self.db.prepare(
+            "SELECT a.kind, a.value FROM artifacts a JOIN messages m ON m.id = a.message
+             WHERE a.session_key = ?1 OR a.session_key IN (SELECT key FROM sessions WHERE parent_key = ?1)
+             ORDER BY m.at, m.position",
+        )?;
+        let artifacts = query
+            .query_map([key], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut seen = HashSet::new();
+        let (mut pull_requests, mut changed_files) = (Vec::new(), Vec::new());
+        for (kind, value) in artifacts {
+            if !seen.insert(value.clone()) {
+                continue;
+            }
+            match kind.as_str() {
+                "pull_request" => pull_requests.push(value),
+                _ => changed_files.push(value),
+            }
+        }
+        let changed_files_total = changed_files.len();
+        changed_files.truncate(CHANGED_FILES);
+
+        let mut query = self.db.prepare(
+            "SELECT key, title, message_count FROM sessions WHERE parent_key = ?1 ORDER BY started_at, key",
+        )?;
+        let subagents = query
+            .query_map([key], |row| {
+                Ok(Subagent {
+                    key: row.get(0)?,
+                    title: row.get(1)?,
+                    message_count: row.get::<_, i64>(2)? as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(BriefBody {
+            first_request,
+            last_answer,
+            pull_requests,
+            changed_files,
+            changed_files_total,
+            subagents,
+        })
+    }
+
+    /// The first row of `sql` whose text has something left after removing injected reminders.
+    fn first_text(&self, sql: &str, key: &str, chars: usize) -> Result<Option<String>> {
+        let mut query = self.db.prepare(sql)?;
+        let mut rows = query.query([key])?;
+        while let Some(row) = rows.next()? {
+            let text: String = row.get(0)?;
+            let text = SYSTEM_REMINDER.replace_all(&text, "");
+            let text = COMMAND.replace_all(&text, "$name $args");
+            let text = text.trim();
+            if !text.is_empty() {
+                return Ok(Some(cut(text, chars)));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn stats(&self) -> Result<Stats> {
+        let raw = View::open(&self.dir)?;
+        let [streams, segments, versions] = raw.counts()?.map(|(_, n)| n);
+        let count = |table: &str| -> Result<u64> {
+            let n: i64 =
+                self.db
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })?;
+            Ok(n as u64)
+        };
+        let counts = Counts {
+            streams,
+            segments,
+            versions,
+            sessions: count("sessions")?,
+            messages: count("messages")?,
+            aliases: count("aliases")?,
+            media: count("media")?,
+            artifacts: count("artifacts")?,
+        };
+        let mut stream_stats: Vec<StreamStats> = raw
+            .streams()?
+            .into_iter()
+            .map(|stream| {
+                let (offset, checksum) = match stream.state.progress {
+                    Progress::Append {
+                        confirmed_offset, ..
+                    } => (Some(confirmed_offset), None),
+                    Progress::Replace { latest_checksum } => (None, Some(latest_checksum.to_hex())),
+                };
+                StreamStats {
+                    locator: stream.key.locator,
+                    generation: stream.state.generation,
+                    offset,
+                    checksum,
+                }
+            })
+            .collect();
+        stream_stats.sort_by(|a, b| {
+            (&a.locator, a.generation, a.offset, &a.checksum).cmp(&(
+                &b.locator,
+                b.generation,
+                b.offset,
+                &b.checksum,
+            ))
+        });
+        let mut query = self
+            .db
+            .prepare("SELECT key, message_count FROM sessions ORDER BY key")?;
+        let sessions = query
+            .query_map([], |row| {
+                Ok(SessionStats {
+                    key: row.get(0)?,
+                    message_count: row.get::<_, i64>(1)? as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(Stats {
+            counts,
+            streams: stream_stats,
+            sessions,
+        })
+    }
+}
+
+/// The lowercase ID prefix in `input`, if it has at least 8 hex digits and nothing but hex digits and hyphens.
+fn id_prefix(input: &str) -> Option<String> {
+    let lower = input.to_ascii_lowercase();
+    let digits = lower.chars().filter(char::is_ascii_hexdigit).count();
+    (digits >= MIN_ID_PREFIX && lower.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
+        .then_some(lower)
+}
+
+/// The distinct search words in a query, lowercased, without stop words unless nothing else is left.
+pub fn terms(query: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    for word in query.split(|c: char| !c.is_alphanumeric()) {
+        let word = word.to_lowercase();
+        if !word.is_empty() && !words.contains(&word) {
+            words.push(word);
+        }
+    }
+    let content: Vec<String> = words
+        .iter()
+        .filter(|word| {
+            !STOP_WORDS
+                .split_whitespace()
+                .any(|stop| stop == word.as_str())
+        })
+        .cloned()
+        .collect();
+    if content.is_empty() { words } else { content }
+}
+
+/// BM25's inverse document frequency, with main sessions as the documents.
+fn session_idf(sessions: i64, matched: usize) -> f64 {
+    let (n, df) = (sessions as f64, matched as f64);
+    (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
+}
+
+fn phrase(term: &str) -> String {
+    format!("\"{}\"", term.replace('"', "\"\""))
+}
+
+fn cut(text: &str, chars: usize) -> String {
+    match text.char_indices().nth(chars) {
+        Some((end, _)) => format!("{}...", &text[..end]),
+        None => text.to_owned(),
+    }
+}

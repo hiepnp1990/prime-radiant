@@ -1,5 +1,6 @@
 pub mod collect;
 pub mod index;
+pub mod query;
 pub mod raw;
 pub mod redact;
 
@@ -11,6 +12,8 @@ pub enum Error {
     Io(io::Error),
     Db(rusqlite::Error),
     Corrupt(String),
+    /// A request the store cannot answer, such as an unknown session.
+    Usage(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -21,6 +24,7 @@ impl fmt::Display for Error {
             Error::Io(error) => write!(f, "file error: {error}"),
             Error::Db(error) => write!(f, "database error: {error}"),
             Error::Corrupt(what) => write!(f, "raw store is corrupt: {what}"),
+            Error::Usage(what) => f.write_str(what),
         }
     }
 }

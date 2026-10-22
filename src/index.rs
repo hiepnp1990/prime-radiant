@@ -1,6 +1,7 @@
 pub mod claude_code;
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -11,7 +12,8 @@ use crate::{Error, Result};
 /// What one source's parser knows: which session a stream feeds, and what its bytes mean.
 pub trait Parser {
     /// The session a stream belongs to, or `None` for a stream the parser does not read.
-    fn session(&self, locator: &str) -> Option<Identity>;
+    /// `first_line` is the first complete line of an append stream, without its newline.
+    fn session(&self, locator: &str, first_line: Option<&[u8]>) -> Option<Identity>;
     /// One complete line of an append stream, without its newline.
     fn line(&self, line: &[u8]) -> Line;
     /// The latest version of a replace stream.
@@ -184,6 +186,49 @@ impl Timestamp {
     }
 }
 
+impl serde::Serialize for Timestamp {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl fmt::Display for Timestamp {
+    /// Writes `YYYY-MM-DDTHH:MM:SSZ`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let seconds = self.0.div_euclid(1000);
+        let (days, clock) = (seconds.div_euclid(86_400), seconds.rem_euclid(86_400));
+        let (year, month, day) = civil_from_days(days);
+        write!(
+            f,
+            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+            clock / 3600,
+            clock / 60 % 60,
+            clock % 60
+        )
+    }
+}
+
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let days = days + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = year.div_euclid(400);
@@ -318,6 +363,14 @@ CREATE TRIGGER IF NOT EXISTS sessions_search_update AFTER UPDATE OF title ON ses
     INSERT INTO title_search (title_search, rowid, title, key) VALUES ('delete', old.id, old.title, old.key);
     INSERT INTO title_search (rowid, title, key) VALUES (new.id, new.title, new.key);
 END;
+
+CREATE TABLE IF NOT EXISTS briefs (
+    session_key TEXT PRIMARY KEY REFERENCES sessions (key),
+    body TEXT NOT NULL,
+    built_through INTEGER,
+    built_at INTEGER NOT NULL,
+    method TEXT NOT NULL
+);
 ";
 
 /// The only writer of the session layer, in `index.db` beside the raw layer.
@@ -329,10 +382,7 @@ pub struct Indexer {
 impl Indexer {
     pub fn open(dir: &Path) -> Result<Self> {
         let raw = View::open(dir)?;
-        let db = Connection::open(dir.join("index.db"))?;
-        db.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
-        db.pragma_update(None, "foreign_keys", "ON")?;
-        db.execute_batch(SCHEMA)?;
+        let db = open_db(dir)?;
         Ok(Self { raw, db })
     }
 
@@ -342,16 +392,13 @@ impl Indexer {
         let mut summary = SyncSummary::default();
         for stream in self.raw.streams()? {
             let parser = parser(stream.key.source);
-            let Some(identity) = parser.session(&stream.key.locator) else {
-                continue;
-            };
             let before = indexed.get(&stream.id).copied();
             let added = match stream.state.progress {
                 Progress::Append {
                     confirmed_offset, ..
-                } => self.sync_append(parser, &stream, &identity, before, confirmed_offset)?,
+                } => self.sync_append(parser, &stream, before, confirmed_offset)?,
                 Progress::Replace { latest_checksum } => {
-                    self.sync_replace(parser, &stream, &identity, before, latest_checksum)?
+                    self.sync_replace(parser, &stream, before, latest_checksum)?
                 }
             };
             if let Some(added) = added {
@@ -401,7 +448,6 @@ impl Indexer {
         &mut self,
         parser: &dyn Parser,
         stream: &Stream,
-        identity: &Identity,
         before: Option<Indexed>,
         confirmed_offset: u64,
     ) -> Result<Option<usize>> {
@@ -431,9 +477,13 @@ impl Indexer {
         if complete == 0 && !restart {
             return Ok(None);
         }
+        let first_line = self.first_line(stream, confirmed_offset)?;
+        let Some(identity) = parser.session(&stream.key.locator, Some(&first_line)) else {
+            return Ok(None);
+        };
 
         let tx = self.db.transaction()?;
-        let key = ensure_session(&tx, stream, identity)?;
+        let key = ensure_session(&tx, stream, &identity)?;
         if restart {
             tx.execute("DELETE FROM messages WHERE raw_stream = ?1", [stream.id.0])?;
         }
@@ -484,7 +534,6 @@ impl Indexer {
         &mut self,
         parser: &dyn Parser,
         stream: &Stream,
-        identity: &Identity,
         before: Option<Indexed>,
         latest_checksum: Sha256,
     ) -> Result<Option<usize>> {
@@ -495,9 +544,12 @@ impl Indexer {
         {
             return Ok(None);
         }
+        let Some(identity) = parser.session(&stream.key.locator, None) else {
+            return Ok(None);
+        };
         let facts = parser.version(&self.raw.version(latest_checksum)?);
         let tx = self.db.transaction()?;
-        let key = ensure_session(&tx, stream, identity)?;
+        let key = ensure_session(&tx, stream, &identity)?;
         apply_facts(&tx, &key, &facts)?;
         tx.execute(
             "INSERT INTO progress (stream, indexed_checksum) VALUES (?1, ?2)
@@ -508,6 +560,37 @@ impl Indexer {
         tx.commit()?;
         Ok(Some(0))
     }
+
+    /// The bytes before the first newline of the stream's current generation, or all of them if it has none yet.
+    fn first_line(&self, stream: &Stream, end: u64) -> Result<Vec<u8>> {
+        const CHUNK: u64 = 64 * 1024;
+        let mut line = Vec::new();
+        let mut start = 0;
+        while start < end {
+            let chunk = self.raw.read(&RawRef {
+                stream: stream.id,
+                generation: stream.state.generation,
+                start,
+                end: (start + CHUNK).min(end),
+            })?;
+            if let Some(newline) = chunk.iter().position(|b| *b == b'\n') {
+                line.extend_from_slice(&chunk[..newline]);
+                break;
+            }
+            start += chunk.len() as u64;
+            line.extend(chunk);
+        }
+        Ok(line)
+    }
+}
+
+/// Opens `index.db` in `dir`, creating its tables if they are missing.
+pub fn open_db(dir: &Path) -> Result<Connection> {
+    let db = Connection::open(dir.join("index.db"))?;
+    db.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
+    db.pragma_update(None, "foreign_keys", "ON")?;
+    db.execute_batch(SCHEMA)?;
+    Ok(db)
 }
 
 fn ensure_session(tx: &Transaction, stream: &Stream, identity: &Identity) -> Result<SessionKey> {

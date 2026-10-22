@@ -507,3 +507,21 @@ fn append_junk(path: &Path) {
             "junk is appended past the committed offset, as a crash or failed write would leave it",
         );
 }
+
+#[test]
+fn file_deleted_after_the_scan_is_skipped_and_counted() {
+    let setup = Setup::new();
+    let files = claude_code::scan(&setup.root).expect("scan runs");
+    fs::remove_file(setup.path(&main_transcript())).expect("transcript is deleted");
+
+    let summary = collect::import(&files, ORIGIN, Source::ClaudeCode, &mut setup.store())
+        .expect("import goes on past the missing file");
+
+    assert_eq!(summary.files_scanned, files.len());
+    assert_eq!(summary.files_vanished, 1, "the deleted file is counted");
+    assert_eq!(
+        setup.count("streams"),
+        files.len() as i64 - 1,
+        "every other file is imported"
+    );
+}

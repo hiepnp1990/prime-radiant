@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use prime_radiant::collect::import_claude_code;
-use prime_radiant::index::{Indexer, SyncSummary};
+use prime_radiant::index::{Indexer, SyncSummary, Timestamp};
+use prime_radiant::query::Query;
 use prime_radiant::raw::{RawRef, Sha256, Store, StreamId, View};
 use rusqlite::Connection;
 use serde_json::Value;
@@ -704,4 +705,139 @@ fn flat_subagent_transcript_joins_the_session_named_on_its_lines() {
         ],
         "a line appended later joins the same subagent"
     );
+}
+
+const FORK_ID: &str = "9e7d4c21-3b5a-4f60-8a1e-6c2f0b9d8e14";
+const FORK_KEY: &str = "claude-code/9e7d4c21-3b5a-4f60-8a1e-6c2f0b9d8e14";
+
+/// A fork of the fixture session: a plain line written at fork time, a copy of every fixture line,
+/// then lines of its own. `rewrite` gives the copies the fork's ID, as newer Claude Code versions do.
+fn write_fork(setup: &Setup, rewrite: bool) -> PathBuf {
+    let original = fs::read_to_string(setup.main_transcript()).expect("transcript is readable");
+    let (order, _) = lines_by_uuid(&setup.main_transcript());
+    let mut fork = format!(
+        "{}\n",
+        serde_json::json!({
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "sessionId": FORK_ID,
+            "timestamp": "2026-01-16T08:00:00.000Z",
+        })
+    );
+    for line in original.lines() {
+        let mut json: Value = serde_json::from_str(line).expect("line is JSON");
+        if rewrite {
+            json["sessionId"] = Value::from(FORK_ID);
+        }
+        fork.push_str(&format!("{json}\n"));
+    }
+    let own = user_line(
+        "4b1d2a6e-0000-4000-8000-000000000005",
+        order.last().expect("transcript has messages"),
+        "Now add a quiet flag that hides the banner.",
+    )
+    .replace(SESSION_ID, FORK_ID)
+    .replace("2026-01-15T10:02:00.000Z", "2026-01-16T08:00:05.000Z");
+    fork.push_str(&own);
+    let path = setup
+        .root
+        .join("-home-dev-example-project")
+        .join(format!("{FORK_ID}.jsonl"));
+    fs::write(&path, fork).expect("fork transcript is written");
+    path
+}
+
+fn find_keys(setup: &Setup, words: &str) -> Vec<String> {
+    Query::open(&setup.data, Timestamp(0))
+        .expect("query opens")
+        .find(words, 10)
+        .expect("find runs")
+        .into_iter()
+        .map(|hit| hit.key)
+        .collect()
+}
+
+fn assert_fork_attribution(setup: &Setup) {
+    assert_eq!(
+        setup.strings(
+            "SELECT kind || ' ' || COALESCE(parent_key, '-') FROM sessions WHERE key = ?1",
+            FORK_KEY
+        ),
+        [format!("fork {MAIN_KEY}")],
+        "the fork names the session it copied"
+    );
+    let (order, _) = lines_by_uuid(&setup.main_transcript());
+    let copied = setup.strings(
+        "SELECT message_id FROM messages WHERE session_key = ?1 AND copied_from = 'claude-code/33831ab7-5c2a-48a4-a8d7-0b5125040f4d' ORDER BY position",
+        FORK_KEY,
+    );
+    assert_eq!(
+        copied, order,
+        "every copied message is readable in the fork, marked with its origin"
+    );
+    assert!(
+        setup
+            .strings(
+                "SELECT message_id FROM messages WHERE session_key = ?1 AND copied_from IS NOT NULL",
+                MAIN_KEY
+            )
+            .is_empty(),
+        "the origin's own messages are not copies"
+    );
+    assert_eq!(
+        find_keys(setup, "unoptimized"),
+        [MAIN_KEY],
+        "a word only in the copied history counts once, toward the origin"
+    );
+    assert_eq!(
+        find_keys(setup, "quiet banner"),
+        [FORK_KEY],
+        "the fork's own words find the fork"
+    );
+}
+
+#[test]
+fn fork_whose_copied_lines_keep_the_origin_id_is_a_fork_of_that_session() {
+    let setup = Setup::new();
+    write_fork(&setup, false);
+    setup.import();
+    setup.sync();
+    assert_fork_attribution(&setup);
+    assert_eq!(
+        setup.strings(
+            "SELECT COALESCE(title, '-') FROM sessions WHERE key = ?1",
+            FORK_KEY
+        ),
+        ["-"],
+        "a copied title line stays with the session it names"
+    );
+    let brief = Query::open(&setup.data, Timestamp(0))
+        .expect("query opens")
+        .brief(FORK_ID)
+        .expect("brief builds");
+    assert_eq!(
+        brief.body.first_request.as_deref(),
+        Some("Now add a quiet flag that hides the banner."),
+        "a fork's brief starts from its own first request"
+    );
+}
+
+#[test]
+fn fork_with_rewritten_copies_is_attributed_the_same_when_indexed_before_its_origin() {
+    let setup = Setup::new();
+    write_fork(&setup, true);
+    let aside = setup.root.join("origin.jsonl.aside");
+    fs::rename(setup.main_transcript(), &aside).expect("origin transcript moves aside");
+    setup.import();
+    setup.sync();
+    assert_eq!(
+        find_keys(&setup, "unoptimized"),
+        [FORK_KEY],
+        "while the origin is missing, the copied history counts toward the fork"
+    );
+
+    fs::rename(&aside, setup.main_transcript()).expect("origin transcript returns");
+    setup.import();
+    setup.sync();
+    assert_fork_attribution(&setup);
 }

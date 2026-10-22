@@ -1,6 +1,6 @@
 pub mod claude_code;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 
@@ -14,8 +14,8 @@ pub trait Parser {
     /// The session a stream belongs to, or `None` for a stream the parser does not read.
     /// `first_line` is the first complete line of an append stream, without its newline.
     fn session(&self, locator: &str, first_line: Option<&[u8]>) -> Option<Identity>;
-    /// One complete line of an append stream, without its newline.
-    fn line(&self, line: &[u8]) -> Line;
+    /// One complete line of an append stream of `session`, without its newline.
+    fn line(&self, session: &Identity, line: &[u8]) -> Line;
     /// The latest version of a replace stream.
     fn version(&self, bytes: &[u8]) -> Facts;
 }
@@ -61,10 +61,12 @@ impl AliasKind {
 }
 
 /// Session attributes found in a stream. A title replaces the one before it, and the first project wins.
+/// The first timestamp marks when the session started, which decides who owns history that several sessions hold.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Facts {
     pub title: Option<String>,
     pub project: Option<String>,
+    pub started: Option<Timestamp>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -278,11 +280,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     ran_on TEXT NOT NULL,
     title TEXT,
     project TEXT,
-    kind TEXT NOT NULL CHECK (kind IN ('main', 'subagent')),
+    kind TEXT NOT NULL CHECK (kind IN ('main', 'fork', 'subagent')),
     parent_key TEXT,
     started_at INTEGER,
     last_activity INTEGER,
     message_count INTEGER NOT NULL DEFAULT 0,
+    own_message_count INTEGER NOT NULL DEFAULT 0,
     CHECK ((kind = 'main') = (parent_key IS NULL))
 );
 CREATE INDEX IF NOT EXISTS sessions_by_activity ON sessions (last_activity);
@@ -303,10 +306,12 @@ CREATE TABLE IF NOT EXISTS messages (
     raw_generation INTEGER NOT NULL,
     raw_start INTEGER NOT NULL,
     raw_end INTEGER NOT NULL,
+    copied_from TEXT REFERENCES sessions (key),
     UNIQUE (session_key, message_id),
     UNIQUE (session_key, position)
 );
 CREATE INDEX IF NOT EXISTS messages_by_stream ON messages (raw_stream);
+CREATE INDEX IF NOT EXISTS messages_by_id ON messages (message_id);
 
 CREATE TABLE IF NOT EXISTS aliases (
     value TEXT PRIMARY KEY,
@@ -344,13 +349,25 @@ CREATE TABLE IF NOT EXISTS progress (
 CREATE VIRTUAL TABLE IF NOT EXISTS message_search USING fts5 (
     searchable_text, session_key UNINDEXED, content = 'messages', content_rowid = 'id'
 );
-CREATE TRIGGER IF NOT EXISTS messages_search_insert AFTER INSERT ON messages BEGIN
+CREATE TRIGGER IF NOT EXISTS messages_search_insert AFTER INSERT ON messages
+WHEN new.copied_from IS NULL BEGIN
     INSERT INTO message_search (rowid, searchable_text, session_key)
     VALUES (new.id, new.searchable_text, new.session_key);
 END;
-CREATE TRIGGER IF NOT EXISTS messages_search_delete AFTER DELETE ON messages BEGIN
+CREATE TRIGGER IF NOT EXISTS messages_search_delete AFTER DELETE ON messages
+WHEN old.copied_from IS NULL BEGIN
     INSERT INTO message_search (message_search, rowid, searchable_text, session_key)
     VALUES ('delete', old.id, old.searchable_text, old.session_key);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_search_copied AFTER UPDATE OF copied_from ON messages
+WHEN old.copied_from IS NULL AND new.copied_from IS NOT NULL BEGIN
+    INSERT INTO message_search (message_search, rowid, searchable_text, session_key)
+    VALUES ('delete', old.id, old.searchable_text, old.session_key);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_search_uncopied AFTER UPDATE OF copied_from ON messages
+WHEN old.copied_from IS NOT NULL AND new.copied_from IS NULL BEGIN
+    INSERT INTO message_search (rowid, searchable_text, session_key)
+    VALUES (new.id, new.searchable_text, new.session_key);
 END;
 
 CREATE VIRTUAL TABLE IF NOT EXISTS title_search USING fts5 (
@@ -484,8 +501,18 @@ impl Indexer {
 
         let tx = self.db.transaction()?;
         let key = ensure_session(&tx, stream, &identity)?;
+        let mut touched: Vec<String> = Vec::new();
         if restart {
-            tx.execute("DELETE FROM messages WHERE raw_stream = ?1", [stream.id.0])?;
+            let mut delete =
+                tx.prepare("DELETE FROM messages WHERE raw_stream = ?1 RETURNING message_id")?;
+            touched = delete
+                .query_map([stream.id.0], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            drop(delete);
+            tx.execute(
+                "UPDATE sessions SET started_at = NULL WHERE key = ?1",
+                [key.as_str()],
+            )?;
         }
         let mut position: i64 = tx.query_row(
             "SELECT COALESCE(MAX(position) + 1, 0) FROM messages WHERE session_key = ?1",
@@ -493,7 +520,7 @@ impl Indexer {
             |row| row.get(0),
         )?;
         let mut facts = Facts::default();
-        let mut added = 0;
+        let mut inserted = Vec::new();
         let mut line_start = start;
         for line in bytes[..complete].split_inclusive(|b| *b == b'\n') {
             let raw = RawRef {
@@ -503,20 +530,29 @@ impl Indexer {
                 end: line_start + line.len() as u64 - 1,
             };
             line_start += line.len() as u64;
-            let parsed = parser.line(&line[..line.len() - 1]);
+            let parsed = parser.line(&identity, &line[..line.len() - 1]);
             facts.title = parsed.facts.title.or(facts.title);
             facts.project = facts.project.or(parsed.facts.project);
+            facts.started = facts.started.or(parsed.facts.started);
             if let Some(message) = parsed.message
                 && insert_if_new(&tx, &key, position, &message, &raw)?
             {
                 position += 1;
-                added += 1;
+                inserted.push(message.id);
             }
         }
-        apply_facts(&tx, &key, &facts)?;
+        let added = inserted.len();
+        if apply_facts(&tx, &key, &facts)? {
+            let mut all = tx.prepare("SELECT message_id FROM messages WHERE session_key = ?1")?;
+            inserted = all
+                .query_map([key.as_str()], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+        }
+        touched.extend(inserted);
+        attribute_copies(&tx, stream.key.source, &key, &touched)?;
         tx.execute(
-            "UPDATE sessions SET (started_at, last_activity, message_count) =
-                (SELECT MIN(at), MAX(at), COUNT(*) FROM messages WHERE session_key = ?1)
+            "UPDATE sessions SET (last_activity, message_count) =
+                (SELECT MAX(at), COUNT(*) FROM messages WHERE session_key = ?1)
              WHERE key = ?1",
             [key.as_str()],
         )?;
@@ -623,7 +659,8 @@ fn ensure_session(tx: &Transaction, stream: &Stream, identity: &Identity) -> Res
     Ok(key)
 }
 
-fn apply_facts(tx: &Transaction, key: &SessionKey, facts: &Facts) -> Result<()> {
+/// Records `facts` on the session. Returns whether this set the session's start, which can change who owns its messages.
+fn apply_facts(tx: &Transaction, key: &SessionKey, facts: &Facts) -> Result<bool> {
     if let Some(title) = &facts.title {
         tx.execute(
             "UPDATE sessions SET title = ?2 WHERE key = ?1 AND title IS NOT ?2",
@@ -635,6 +672,69 @@ fn apply_facts(tx: &Transaction, key: &SessionKey, facts: &Facts) -> Result<()> 
             "UPDATE sessions SET project = ?2 WHERE key = ?1 AND project IS NULL",
             params![key.as_str(), project],
         )?;
+    }
+    let started = match facts.started {
+        Some(at) => {
+            tx.execute(
+                "UPDATE sessions SET started_at = ?2 WHERE key = ?1 AND started_at IS NULL",
+                params![key.as_str(), at.0],
+            )? > 0
+        }
+        None => false,
+    };
+    Ok(started)
+}
+
+/// A message ID that several sessions hold is one message, copied when Claude Code forks or resumes a session.
+/// The session that started first owns it, and every other holder marks its copy with the owner, which keeps
+/// the copy readable but out of search. A main session that holds copies is a fork of the session it copied last.
+fn attribute_copies(
+    tx: &Transaction,
+    source: Source,
+    key: &SessionKey,
+    message_ids: &[String],
+) -> Result<()> {
+    let mut holders = tx.prepare_cached(
+        "SELECT m.session_key, m.copied_from FROM messages m JOIN sessions s ON s.key = m.session_key
+         WHERE m.message_id = ?1 AND s.source = ?2
+         ORDER BY s.started_at IS NULL, s.started_at, s.key",
+    )?;
+    let mut mark = tx.prepare_cached(
+        "UPDATE messages SET copied_from = ?3 WHERE message_id = ?1 AND session_key = ?2",
+    )?;
+    let mut changed: HashSet<String> = HashSet::from([key.as_str().to_owned()]);
+    for id in message_ids {
+        let rows = holders
+            .query_map(params![id, source.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let Some((owner, _)) = rows.first() else {
+            continue;
+        };
+        for (session, copied_from) in &rows {
+            let origin = (session != owner).then_some(owner);
+            if copied_from.as_ref() != origin {
+                mark.execute(params![id, session, origin])?;
+                changed.insert(session.clone());
+            }
+        }
+    }
+    let mut lineage = tx.prepare_cached(
+        "UPDATE sessions SET (kind, parent_key) = (
+            SELECT CASE WHEN origin IS NULL THEN 'main' ELSE 'fork' END, origin FROM (
+                SELECT (SELECT copied_from FROM messages WHERE session_key = ?1 AND copied_from IS NOT NULL
+                        ORDER BY position DESC LIMIT 1) AS origin))
+         WHERE key = ?1 AND kind <> 'subagent'",
+    )?;
+    let mut own = tx.prepare_cached(
+        "UPDATE sessions SET own_message_count =
+            (SELECT COUNT(*) FROM messages WHERE session_key = ?1 AND copied_from IS NULL)
+         WHERE key = ?1",
+    )?;
+    for session in &changed {
+        lineage.execute([session])?;
+        own.execute([session])?;
     }
     Ok(())
 }

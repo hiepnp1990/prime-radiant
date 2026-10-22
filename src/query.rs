@@ -13,9 +13,11 @@ use crate::{Error, Result};
 
 const LIVE_WINDOW_MS: i64 = 10 * 60 * 1000;
 const MIN_ID_PREFIX: usize = 8;
-/// How many of a term's best messages count toward session scores. A term common enough to pass this adds little anyway.
-const MESSAGES_PER_TERM: i64 = 5000;
 const TITLE_WEIGHT: f64 = 3.0;
+/// How much a session's score grows when its own title has every query term, weighted by each term's rarity.
+const TITLE_COVERAGE_BONUS: f64 = 2.0;
+/// How much a long session's score shrinks, by the log of its length over the mean. A long session matches more words by chance.
+const LENGTH_PENALTY: f64 = 0.5;
 const SNIPPET_TOKENS: i64 = 24;
 
 const FIRST_REQUEST_CHARS: usize = 600;
@@ -254,7 +256,8 @@ impl Query {
             return Ok(Vec::new());
         };
         let mut query = self.db.prepare(
-            "SELECT DISTINCT s.key, s.parent_key FROM aliases a JOIN sessions s ON s.key = a.session_key
+            "SELECT DISTINCT s.key, IIF(s.kind = 'subagent', s.parent_key, NULL)
+             FROM aliases a JOIN sessions s ON s.key = a.session_key
              WHERE substr(a.value, 1, length(?1)) = ?1
              ORDER BY s.last_activity DESC, s.key",
         )?;
@@ -280,48 +283,51 @@ impl Query {
         let main_of = self.main_sessions()?;
         let main = |key: String| main_of.get(&key).cloned().unwrap_or(key);
         let main_count: i64 = self.db.query_row(
-            "SELECT COUNT(*) FROM sessions WHERE parent_key IS NULL",
+            "SELECT COUNT(*) FROM sessions WHERE kind <> 'subagent'",
             [],
             |row| row.get(0),
         )?;
 
-        // Per main session, the best score of each term in any of its messages or titles.
+        // Per main or fork session, the best score of each term in any of its messages or titles.
         let mut term_scores: HashMap<String, Vec<f64>> = HashMap::new();
         let mut idf = Vec::with_capacity(terms.len());
-        let mut sessions_with = self.db.prepare(
-            "SELECT DISTINCT session_key FROM message_search WHERE message_search MATCH ?1",
-        )?;
         let mut message_scores: HashMap<i64, (String, f64)> = HashMap::new();
+        // Per session, which terms its own title has.
+        let mut title_terms: HashMap<String, Vec<bool>> = HashMap::new();
         let mut messages = self.db.prepare(
-            "SELECT rowid, session_key, -bm25(message_search) FROM message_search
-             WHERE message_search MATCH ?1 ORDER BY rank LIMIT ?2",
+            "SELECT rowid, session_key, -bm25(message_search) FROM message_search WHERE message_search MATCH ?1",
         )?;
         let mut titles = self.db.prepare(
             "SELECT key, -bm25(title_search) FROM title_search WHERE title_search MATCH ?1",
         )?;
         for (i, term) in terms.iter().enumerate() {
             let phrase = phrase(term);
-            let rows = messages
-                .query_map(params![phrase, MESSAGES_PER_TERM], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get(2)?))
-                })?
-                .collect::<rusqlite::Result<Vec<(i64, String, f64)>>>()?;
-            for (rowid, session, score) in rows {
+            let mut matched: HashSet<String> = HashSet::new();
+            let rows = messages.query_map([&phrase], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get(2)?))
+            })?;
+            for row in rows {
+                let (rowid, session, score): (i64, String, f64) = row?;
                 let session = main(session);
                 let best = &mut term_scores
                     .entry(session.clone())
                     .or_insert_with(|| vec![0.0; terms.len()])[i];
                 *best = best.max(score);
-                message_scores.entry(rowid).or_insert((session, 0.0)).1 += score;
+                message_scores
+                    .entry(rowid)
+                    .or_insert((session.clone(), 0.0))
+                    .1 += score;
+                matched.insert(session);
             }
             let rows = titles
                 .query_map([&phrase], |row| Ok((row.get::<_, String>(0)?, row.get(1)?)))?
                 .collect::<rusqlite::Result<Vec<(String, f64)>>>()?;
-            let mut matched: HashSet<String> = sessions_with
-                .query_map([&phrase], |row| row.get(0))?
-                .map(|key| key.map(main))
-                .collect::<rusqlite::Result<_>>()?;
             for (session, score) in rows {
+                if !main_of.contains_key(&session) {
+                    title_terms
+                        .entry(session.clone())
+                        .or_insert_with(|| vec![false; terms.len()])[i] = true;
+                }
                 let session = main(session);
                 term_scores
                     .entry(session.clone())
@@ -331,12 +337,28 @@ impl Query {
             idf.push(session_idf(main_count, matched.len()));
         }
 
+        let idf_total: f64 = idf.iter().sum();
         let last_activity = self.last_activity()?;
+        let sizes = self.sizes(&main_of)?;
+        let mean_size = sizes.values().sum::<f64>() / sizes.len().max(1) as f64;
         let mut ranked: Vec<(String, f64)> = term_scores
             .into_iter()
             .map(|(session, scores)| {
-                let score = scores.iter().zip(&idf).map(|(s, w)| s * w).sum();
-                (session, score)
+                let score: f64 = scores.iter().zip(&idf).map(|(s, w)| s * w).sum();
+                let coverage = title_terms.get(&session).map_or(0.0, |has| {
+                    has.iter()
+                        .zip(&idf)
+                        .filter(|(has, _)| **has)
+                        .map(|(_, w)| w)
+                        .sum::<f64>()
+                        / idf_total
+                });
+                let size = sizes.get(&session).copied().unwrap_or(0.0);
+                let length = 1.0 + LENGTH_PENALTY * (1.0 + size / mean_size).ln();
+                (
+                    session,
+                    score * (1.0 + TITLE_COVERAGE_BONUS * coverage) / length,
+                )
             })
             .collect();
         ranked.sort_by(|a, b| {
@@ -370,11 +392,27 @@ impl Query {
             .collect()
     }
 
+    /// How many searchable messages each main or fork session holds, counting its subagents' and not its copies.
+    fn sizes(&self, main_of: &HashMap<String, String>) -> Result<HashMap<String, f64>> {
+        let mut query = self
+            .db
+            .prepare("SELECT key, own_message_count FROM sessions WHERE own_message_count > 0")?;
+        let mut sizes: HashMap<String, f64> = HashMap::new();
+        for row in query.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })? {
+            let (key, count) = row?;
+            let session = main_of.get(&key).cloned().unwrap_or(key);
+            *sizes.entry(session).or_default() += count;
+        }
+        Ok(sizes)
+    }
+
     /// Maps each subagent session to its main session.
     fn main_sessions(&self) -> Result<HashMap<String, String>> {
         let mut query = self
             .db
-            .prepare("SELECT key, parent_key FROM sessions WHERE parent_key IS NOT NULL")?;
+            .prepare("SELECT key, parent_key FROM sessions WHERE kind = 'subagent'")?;
         let rows = query
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<HashMap<String, String>>>()?;
@@ -489,7 +527,8 @@ impl Query {
 
     fn extract(&self, key: &str) -> Result<BriefBody> {
         let first_request = self.first_text(
-            "SELECT searchable_text FROM messages WHERE session_key = ?1 AND role = 'user' ORDER BY position",
+            "SELECT searchable_text FROM messages WHERE session_key = ?1 AND role = 'user' AND copied_from IS NULL
+             ORDER BY position",
             key,
             FIRST_REQUEST_CHARS,
         )?;
@@ -501,7 +540,8 @@ impl Query {
 
         let mut query = self.db.prepare(
             "SELECT a.kind, a.value FROM artifacts a JOIN messages m ON m.id = a.message
-             WHERE a.session_key = ?1 OR a.session_key IN (SELECT key FROM sessions WHERE parent_key = ?1)
+             WHERE a.session_key = ?1
+                OR a.session_key IN (SELECT key FROM sessions WHERE parent_key = ?1 AND kind = 'subagent')
              ORDER BY m.at, m.position",
         )?;
         let artifacts = query
@@ -524,7 +564,8 @@ impl Query {
         changed_files.truncate(CHANGED_FILES);
 
         let mut query = self.db.prepare(
-            "SELECT key, title, message_count FROM sessions WHERE parent_key = ?1 ORDER BY started_at, key",
+            "SELECT key, title, message_count FROM sessions WHERE parent_key = ?1 AND kind = 'subagent'
+             ORDER BY started_at, key",
         )?;
         let subagents = query
             .query_map([key], |row| {
@@ -657,7 +698,7 @@ pub fn terms(query: &str) -> Vec<String> {
     if content.is_empty() { words } else { content }
 }
 
-/// BM25's inverse document frequency, with main sessions as the documents.
+/// BM25's inverse document frequency, with main and fork sessions as the documents.
 fn session_idf(sessions: i64, matched: usize) -> f64 {
     let (n, df) = (sessions as f64, matched as f64);
     (1.0 + (n - df + 0.5) / (df + 0.5)).ln()

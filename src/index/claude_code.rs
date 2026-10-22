@@ -53,13 +53,24 @@ impl Parser for ClaudeCode {
         }
     }
 
-    fn line(&self, line: &[u8]) -> Line {
+    fn line(&self, session: &Identity, line: &[u8]) -> Line {
         let Ok(line) = serde_json::from_slice::<RawLine>(line) else {
             return Line::default();
         };
-        let facts = Facts {
-            title: line.custom_title.clone().or_else(|| line.ai_title.clone()),
-            project: line.cwd.clone(),
+        // A fork's transcript can start with lines copied from the session it forked, which keep that session's ID.
+        let copied = session.lineage == Lineage::Main
+            && line
+                .session_id
+                .as_deref()
+                .is_some_and(|id| id != session.native_id);
+        let facts = if copied {
+            Facts::default()
+        } else {
+            Facts {
+                title: line.custom_title.clone().or_else(|| line.ai_title.clone()),
+                project: line.cwd.clone(),
+                started: line.timestamp.as_deref().and_then(Timestamp::parse_utc),
+            }
         };
         let message = line.uuid.clone().map(|id| message(id, line));
         Line { message, facts }
@@ -70,6 +81,7 @@ impl Parser for ClaudeCode {
         Facts {
             title: file.custom_title.or(file.description),
             project: None,
+            started: None,
         }
     }
 }

@@ -24,3 +24,24 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets
+
+  release:
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: prime-radiant-linux-x86_64
+          - os: macos-latest
+            artifact: prime-radiant-macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: target/release/prime-radiant
+          retention-days: 14

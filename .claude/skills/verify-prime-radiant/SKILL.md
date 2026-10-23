@@ -1,11 +1,11 @@
 ---
 name: verify-prime-radiant
-description: Drive a disposable Prime Radiant instance (CLI, hub, collector) built from this checkout and capture proof that import, find, brief, read, grep, live sync, and remote access work. Also measures search quality on the user's own sessions. Use before claiming a change to collection, indexing, search, the hub, or the CLI works, or when asked to verify Prime Radiant.
+description: Drive a disposable Prime Radiant instance (CLI, hub, collector) built from this checkout and capture proof that import, find, brief, read, grep, live sync, remote access, and collector progress and status work. Also measures search quality on the user's own sessions. Use before claiming a change to collection, indexing, search, the hub, or the CLI works, or when asked to verify Prime Radiant.
 ---
 
 # Verify Prime Radiant
 
-Prime Radiant is a CLI. Users touch it through `prime-radiant import|stats|find|brief|read|grep`, a hub (`hub serve`, reached through `hub connect` over any stdio pipe such as SSH), and a collector (`collect`) that streams session files to the hub. Verification drives the real binary against copies of `tests/fixtures/`, never against the user's live hub.
+Prime Radiant is a CLI. Users touch it through `prime-radiant import|stats|find|brief|read|grep|status`, a hub (`hub serve`, reached through `hub connect` over any stdio pipe such as SSH), and a collector (`collect`) that streams session files to the hub. Verification drives the real binary against copies of `tests/fixtures/`, never against the user's live hub.
 
 Everything goes through `scripts/verify.sh` (run it with bash). Paths below are relative to this skill's folder.
 
@@ -80,5 +80,5 @@ It stops only the hub and collector whose pid files are in `RUN`, and only if th
 
 ## Helpers
 
-- `scripts/verify.sh`: `launch`, `doctor`, `cli`, `collector start|stop|crash`, `token`, `append`, `wait-find`, `cleanup`. Run `scripts/verify.sh` with no arguments for usage.
+- `scripts/verify.sh`: `launch`, `doctor`, `cli`, `collector start|stop|crash`, `hub stop|start`, `big-session`, `token`, `append`, `wait-find`, `cleanup`. Run `scripts/verify.sh` with no arguments for usage.
 - `eval/`: ground truth and scoring for search quality on the user's own sessions. See `features/search-quality.md`.

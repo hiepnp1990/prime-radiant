@@ -8,6 +8,7 @@ use std::fmt;
 use std::iter;
 use std::ops::Range;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
@@ -222,6 +223,14 @@ pub struct Media {
 pub struct Timestamp(pub i64);
 
 impl Timestamp {
+    pub fn now() -> Self {
+        Self(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_millis() as i64),
+        )
+    }
+
     /// Parses `YYYY-MM-DDTHH:MM:SS[.fff]Z`, the form JavaScript's `toISOString` writes.
     pub fn parse_utc(text: &str) -> Option<Self> {
         let rest = text.strip_suffix('Z')?;

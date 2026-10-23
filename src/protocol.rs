@@ -44,6 +44,19 @@ pub enum Request {
     Write(Write),
     /// A question any client can ask, answered from the hub's index.
     Ask(Ask),
+    /// What the hub holds from each origin. A hub older than this request answers with an error and closes.
+    Origins,
+}
+
+/// What the hub holds from one origin.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OriginStats {
+    pub origin: String,
+    pub streams: u64,
+    /// The bytes of each stream's current copy: an append stream's confirmed bytes, a replace stream's latest version.
+    pub confirmed_bytes: u64,
+    /// When the hub last stored new bytes or a new version from the origin, or `None` if not since it started.
+    pub last_write: Option<Timestamp>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -79,6 +92,9 @@ pub enum Response {
     /// The same JSON that `grep --json` prints.
     Matches {
         matches: Value,
+    },
+    Origins {
+        origins: Vec<OriginStats>,
     },
     /// The hub could not answer. After a protocol violation, it also closes the connection.
     Error {
@@ -131,6 +147,7 @@ enum Header {
         session: String,
         pattern: String,
     },
+    Origins,
 }
 
 /// A write without its bytes.
@@ -204,6 +221,7 @@ pub fn write_request(out: &mut impl io::Write, request: &Request) -> io::Result<
             &[],
         ),
         Request::Ask(ask) => (ask_header(ask.clone()), &[]),
+        Request::Origins => (Header::Origins, &[]),
     };
     write_frame(out, &header, payload)
 }
@@ -272,6 +290,7 @@ pub fn read_request(input: &mut impl Read) -> io::Result<Option<Request>> {
         Header::Stats => Request::Ask(Ask::Stats),
         Header::Read { session, page } => Request::Ask(Ask::Read { session, page }),
         Header::Grep { session, pattern } => Request::Ask(Ask::Grep { session, pattern }),
+        Header::Origins => Request::Origins,
     };
     Ok(Some(request))
 }

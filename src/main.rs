@@ -1,15 +1,19 @@
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use clap::builder::{PossibleValuesParser, TypedValueParser};
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use prime_radiant::client::{self, HubAddress};
 use prime_radiant::collect::live;
+use prime_radiant::collect::progress::{self, Found, Phase, Snapshot};
 use prime_radiant::collect::{import_claude_code, import_codex, import_grok, import_t3_code};
 use prime_radiant::hub;
 use prime_radiant::index::{Indexer, Timestamp};
-use prime_radiant::protocol::Request;
+use prime_radiant::protocol::{OriginStats, Request, Response};
 use prime_radiant::query::{Answer, Ask, Brief, Filters, Find, Hit, ParentKind, Query, Stats};
 use prime_radiant::raw::{Source, Store};
 use prime_radiant::transcript::{Matches, Page};
@@ -19,6 +23,9 @@ const WIDTH: usize = 100;
 /// A hub command for query commands given no `--data`, `--hub-socket`, or `--hub-command`.
 const HUB_ENV: &str = "PRIME_RADIANT_HUB";
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+/// How long `status` waits for the hub, and how often `status --watch` asks it again.
+const HUB_TIMEOUT: Duration = Duration::from_secs(10);
+const HUB_EVERY: Duration = Duration::from_secs(5);
 
 #[derive(Parser)]
 #[command(
@@ -133,6 +140,28 @@ enum Command {
         /// How often to rescan every source for changes the file watcher missed.
         #[arg(long, default_value_t = 300)]
         sweep_seconds: u64,
+        /// Where to keep what this collector is doing, for `prime-radiant status`. It is rewritten about once a second.
+        /// Defaults to collect-<origin>.json in $XDG_STATE_HOME/prime-radiant, or in ~/.local/state/prime-radiant.
+        #[arg(long, value_name = "PATH")]
+        state_file: Option<PathBuf>,
+    },
+    /// Show what each collector on this machine is doing, and what the hub holds from each origin.
+    ///
+    /// It asks the hub that --data, --hub-socket, --hub-command, or PRIME_RADIANT_HUB names, and --data names the hub
+    /// that serves that folder. Without a hub, it shows only the collectors, and why the hub part is missing.
+    Status {
+        /// The folder of the collectors' state files. Defaults to $XDG_STATE_HOME/prime-radiant, or
+        /// ~/.local/state/prime-radiant.
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<PathBuf>,
+        #[command(flatten)]
+        target: Target,
+        /// Redraw about once a second until Ctrl-C.
+        #[arg(long)]
+        watch: bool,
+        /// Print one JSON object, or one line of JSON a second with --watch.
+        #[arg(long)]
+        json: bool,
     },
     /// Keep the hub or a collector running as this user's service: a systemd user unit on Linux, a launchd agent on macOS.
     Service {
@@ -245,7 +274,7 @@ impl Answerer {
         match &self.at {
             At::Hub(hub) => Answer::try_from(client::ask(hub, Request::Ask(ask))?),
             At::Local(dir) => {
-                let answer = Query::open(dir, now())?.answer(ask)?;
+                let answer = Query::open(dir, Timestamp::now())?.answer(ask)?;
                 if let Answer::Brief(brief) = &answer
                     && brief.freshness.rebuilt
                     && let Err(error) =
@@ -472,17 +501,23 @@ fn run(command: Command) -> prime_radiant::Result<()> {
             sources,
             hub,
             sweep_seconds,
+            state_file,
         } => live::run(live::Options {
+            state_file: state_file.or_else(|| {
+                progress::default_dir().map(|dir| dir.join(progress::file_name(&origin)))
+            }),
             origin,
             sources: sources.into_list(),
-            hub: match (hub.hub_socket, hub.hub_command) {
-                (Some(socket), _) => HubAddress::Socket(socket),
-                (None, Some(command)) => HubAddress::Command(command),
-                (None, None) => unreachable!("clap requires one of the hub flags"),
-            },
+            hub: hub.address(),
             sweep: Duration::from_secs(sweep_seconds),
         }),
         Command::Service { command } => command.run(),
+        Command::Status {
+            state_dir,
+            target,
+            watch,
+            json,
+        } => status(state_dir, target, watch, json),
     }
 }
 
@@ -510,6 +545,293 @@ fn query(target: Target, ask: Ask, json: bool) -> prime_radiant::Result<()> {
         );
     }
     Ok(())
+}
+
+/// What `status` shows: every collector's state file, and what the hub holds from each origin.
+#[derive(Serialize)]
+struct Status<'a> {
+    state_dir: &'a Path,
+    collectors: Vec<Found>,
+    hub: &'a HubPart,
+}
+
+/// What the hub holds from each origin, or why status cannot say.
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum HubPart {
+    Origins(Vec<OriginStats>),
+    Unavailable(String),
+}
+
+/// Asks the hub in a thread of its own, so that a hub that never answers cannot stop `status`.
+struct HubPoll {
+    /// Where the hub is, as the user named it.
+    label: Option<String>,
+    answers: Option<Receiver<HubPart>>,
+    latest: HubPart,
+    answered: Instant,
+    /// How long the hub may go without answering before status says so.
+    patience: Duration,
+}
+
+impl HubPoll {
+    fn start(target: Target, repeat: bool) -> Self {
+        let (label, address) = match target.answerer() {
+            Ok(Answerer {
+                at: At::Local(dir), ..
+            }) => {
+                let socket = hub::socket_path(&dir);
+                (socket.display().to_string(), HubAddress::Socket(socket))
+            }
+            Ok(Answerer {
+                at: At::Hub(address),
+                ..
+            }) => (
+                match &address {
+                    HubAddress::Socket(socket) => socket.display().to_string(),
+                    HubAddress::Command(command) => command.clone(),
+                },
+                address,
+            ),
+            Err(error) => {
+                return Self {
+                    label: None,
+                    answers: None,
+                    latest: HubPart::Unavailable(format!("no hub to ask: {error}")),
+                    answered: Instant::now(),
+                    patience: HUB_TIMEOUT,
+                };
+            }
+        };
+        let (send, answers) = mpsc::channel();
+        thread::spawn(move || {
+            loop {
+                if send.send(ask_origins(&address)).is_err() || !repeat {
+                    return;
+                }
+                thread::sleep(HUB_EVERY);
+            }
+        });
+        Self {
+            label: Some(label),
+            answers: Some(answers),
+            latest: HubPart::Unavailable("waiting for the hub to answer".to_owned()),
+            answered: Instant::now(),
+            // Asked again every few seconds, the hub has that much longer before it counts as quiet.
+            patience: HUB_TIMEOUT + if repeat { HUB_EVERY } else { Duration::ZERO },
+        }
+    }
+
+    /// The hub's latest answer, waiting up to `wait` for a newer one.
+    fn latest(&mut self, wait: Duration) -> &HubPart {
+        if let Some(answers) = &self.answers {
+            let mut next = answers.recv_timeout(wait).ok();
+            while let Some(answer) = next {
+                self.latest = answer;
+                self.answered = Instant::now();
+                next = answers.try_recv().ok();
+            }
+            let quiet = self.answered.elapsed();
+            if quiet >= self.patience {
+                self.latest = HubPart::Unavailable(format!(
+                    "the hub has not answered for {}",
+                    progress::duration(quiet.as_millis() as i64)
+                ));
+            }
+        }
+        &self.latest
+    }
+}
+
+fn ask_origins(hub: &HubAddress) -> HubPart {
+    match client::ask(hub, Request::Origins) {
+        Ok(Response::Origins { origins }) => HubPart::Origins(origins),
+        Ok(other) => HubPart::Unavailable(format!("the hub answered {other:?}")),
+        // A hub answers "bad frame" to a request it cannot decode, which this client sends only to a hub older than
+        // the question.
+        Err(prime_radiant::Error::Usage(message)) if message.starts_with("bad frame") => {
+            HubPart::Unavailable(format!(
+                "the hub does not know this question, so it is older than this client: {message}"
+            ))
+        }
+        Err(prime_radiant::Error::Usage(message)) => {
+            HubPart::Unavailable(format!("the hub could not answer: {message}"))
+        }
+        Err(prime_radiant::Error::Io(error)) => {
+            HubPart::Unavailable(format!("cannot reach the hub: {error}"))
+        }
+        Err(error) => HubPart::Unavailable(error.to_string()),
+    }
+}
+
+fn status(
+    state_dir: Option<PathBuf>,
+    target: Target,
+    watch: bool,
+    json: bool,
+) -> prime_radiant::Result<()> {
+    let dir = state_dir.or_else(progress::default_dir).ok_or_else(|| {
+        prime_radiant::Error::Usage(
+            "neither XDG_STATE_HOME nor HOME is set; give --state-dir".to_owned(),
+        )
+    })?;
+    let mut hub = HubPoll::start(target, watch);
+    let redraw = watch && !json && io::stdout().is_terminal();
+    let wait = if watch { Duration::ZERO } else { HUB_TIMEOUT };
+    loop {
+        let started = Instant::now();
+        let label = hub.label.clone();
+        let status = Status {
+            state_dir: &dir,
+            collectors: progress::read_dir(&dir)?,
+            hub: hub.latest(wait),
+        };
+        if json && watch {
+            println!(
+                "{}",
+                serde_json::to_string(&status).expect("output serializes")
+            );
+        } else if json {
+            print_json(&status);
+        } else {
+            if redraw {
+                print!("\x1b[H\x1b[2J");
+            }
+            print!(
+                "{}",
+                status_text(&status, label.as_deref(), Timestamp::now())
+            );
+        }
+        if !watch {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_secs(1).saturating_sub(started.elapsed()));
+    }
+}
+
+fn status_text(status: &Status, hub_label: Option<&str>, now: Timestamp) -> String {
+    let mut out = String::new();
+    if status.collectors.is_empty() {
+        out += &wrap(
+            &format!(
+                "collectors: none has written its state in {}",
+                status.state_dir.display()
+            ),
+            "",
+        );
+    } else {
+        out += &wrap(&format!("collectors ({}):", status.state_dir.display()), "");
+    }
+    for found in &status.collectors {
+        match found {
+            Found::Collector { running, state, .. } => out += &collector_text(state, *running, now),
+            Found::Unreadable { file, error } => {
+                out += &wrap(&format!("cannot read {}: {error}", file.display()), "  ");
+            }
+        }
+    }
+    out += "\n";
+    match status.hub {
+        HubPart::Origins(origins) => {
+            out += &wrap(&format!("hub ({}):", hub_label.unwrap_or("?")), "");
+            if origins.is_empty() {
+                out += "  no streams yet\n";
+            }
+            for origin in origins {
+                out += &wrap(
+                    &format!(
+                        "{}: {} streams, {}, {}",
+                        origin.origin,
+                        progress::count(origin.streams),
+                        progress::size(origin.confirmed_bytes),
+                        match origin.last_write {
+                            Some(at) => format!("last write {}", progress::ago(at, now)),
+                            None => "no write since the hub started".to_owned(),
+                        }
+                    ),
+                    "  ",
+                );
+            }
+        }
+        HubPart::Unavailable(why) => out += &wrap(&format!("hub: unavailable: {why}"), ""),
+    }
+    out
+}
+
+/// A collector's lines. A stopped one is shown as it was when it last wrote its state.
+fn collector_text(state: &Snapshot, running: bool, now: Timestamp) -> String {
+    let (mut out, at, was) = if running {
+        let header = format!(
+            "{}: running, pid {}, started {}",
+            state.origin,
+            state.pid,
+            progress::ago(state.started_at, now)
+        );
+        (wrap(&header, "  "), now, "")
+    } else {
+        let header = format!(
+            "{}: stopped, last seen {}",
+            state.origin,
+            progress::ago(state.updated_at, now)
+        );
+        (wrap(&header, "  "), state.updated_at, "when last seen: ")
+    };
+    out += &wrap(&format!("{was}{}", state.summary(at)), "    ");
+    match &state.phase {
+        Phase::FirstSync { progress, .. } => {
+            let files = format!(
+                "{} of {} files done",
+                progress::count(progress.files_done),
+                progress::count(progress.files_total)
+            );
+            out += &wrap(
+                &match &progress.current {
+                    Some(current) => format!(
+                        "sending {}, {} · {files}",
+                        current.locator,
+                        progress::size_of(current.bytes_done, current.bytes_total)
+                    ),
+                    None => files,
+                },
+                "    ",
+            );
+        }
+        Phase::Live { first_sync, .. } => {
+            let sent = match first_sync.files_total {
+                0 => "first sync: the hub lacked nothing".to_owned(),
+                _ => format!(
+                    "first sync {}%: {} files, {}",
+                    first_sync.percent(),
+                    progress::count(first_sync.files_done),
+                    progress::size(first_sync.bytes_done)
+                ),
+            };
+            out += &wrap(&sent, "    ");
+        }
+        Phase::Reconnecting { down_since, .. } => {
+            out += &wrap(
+                &format!(
+                    "no connection to the hub for {}",
+                    progress::duration(at.0 - down_since.0)
+                ),
+                "    ",
+            );
+        }
+        Phase::Connecting | Phase::Scanning { .. } => {}
+    }
+    let mut totals = format!("sent {} since it started", progress::size(state.sent_bytes));
+    totals += &match (&state.last_error, state.errors) {
+        (Some(note), errors) => format!(
+            " · {} {}, the last {}: {}",
+            progress::count(errors),
+            if errors == 1 { "error" } else { "errors" },
+            progress::ago(note.at, now),
+            note.message
+        ),
+        (None, _) => " · no errors".to_owned(),
+    };
+    out += &wrap(&totals, "    ");
+    out
 }
 
 fn import(data: &Path, origin: &str, sources: Vec<(Source, PathBuf)>) -> prime_radiant::Result<()> {
@@ -576,14 +898,6 @@ fn day_or_time(text: &str) -> Result<(Timestamp, Timestamp), String> {
             "expected a day such as 2026-01-15, or an RFC 3339 time such as 2026-01-15T09:30:00Z"
                 .to_owned()
         })
-}
-
-fn now() -> Timestamp {
-    Timestamp(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |since| since.as_millis() as i64),
-    )
 }
 
 fn print_json(value: &impl Serialize) {

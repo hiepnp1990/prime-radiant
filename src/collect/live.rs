@@ -18,7 +18,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
-use super::{Layout, LocalFile, layout, next_write, plan_version, t3_code};
+use super::progress::Reporter;
+use super::{Layout, LocalFile, lacking, layout, next_write, plan_version, t3_code};
 use crate::client::{HubAddress, Transport};
 use crate::protocol::{self, Request, Response, Role};
 use crate::raw::{Applied, Source, StreamKey, StreamState, Write, WriteMode};
@@ -43,6 +44,8 @@ pub struct Options {
     pub hub: HubAddress,
     /// How often to rescan every source, to catch changes the watcher missed.
     pub sweep: Duration,
+    /// Where to keep what the collector is doing, for `prime-radiant status`.
+    pub state_file: Option<PathBuf>,
 }
 
 /// Runs until the process is killed. Returns only if a source or the file watcher is unusable at the start.
@@ -66,7 +69,8 @@ pub fn run(options: Options) -> Result<()> {
             .map(|(path, mode)| (path, mode, false))
             .collect(),
     };
-    watch.ensure();
+    let report = Reporter::start(&options.origin, options.state_file.clone());
+    watch.ensure(&report);
     let mut synced = HashMap::new();
 
     let mut backoff = BACKOFF_MIN;
@@ -75,15 +79,18 @@ pub fn run(options: Options) -> Result<()> {
         link += 1;
         // Changes queued before the connection are covered by the initial sync, which checks every file afterwards.
         while events.try_recv().is_ok() {}
-        let started = Session::start(
-            &options,
-            &sources,
-            &mut watch,
-            &mut synced,
-            link,
-            &events,
-            &inbound,
-        );
+        let started = match Link::open(&options.hub, link, &inbound) {
+            Ok(link) => Session::start(
+                &options,
+                &sources,
+                &mut watch,
+                &mut synced,
+                link,
+                &events,
+                &report,
+            ),
+            Err(error) => Err(error),
+        };
         let error = match started {
             Ok(mut session) => {
                 let error = session.run();
@@ -94,7 +101,7 @@ pub fn run(options: Options) -> Result<()> {
             }
             Err(error) => error,
         };
-        eprintln!("collect: {error}; reconnecting in {}s", backoff.as_secs());
+        report.reconnecting(&error, backoff);
         thread::sleep(backoff);
         backoff = (backoff * 2).min(BACKOFF_MAX);
     }
@@ -167,7 +174,7 @@ struct Watch {
 }
 
 impl Watch {
-    fn ensure(&mut self) {
+    fn ensure(&mut self, report: &Reporter) {
         let Self { watcher, paths } = self;
         for (path, mode, watching) in paths {
             // A folder that a source has not created yet, such as Codex's archive, is watched once it exists.
@@ -176,10 +183,10 @@ impl Watch {
             }
             match watcher.watch(path, *mode) {
                 Ok(()) => *watching = true,
-                Err(error) => eprintln!(
-                    "collect: cannot watch {}, so its changes wait for the next sweep: {error}",
+                Err(error) => report.warn(format!(
+                    "cannot watch {}, so its changes wait for the next sweep: {error}",
                     path.display()
-                ),
+                )),
             }
         }
     }
@@ -381,9 +388,32 @@ impl Unsent<'_> {
     }
 }
 
+/// A file or database the first sync covers.
+enum Item<'a> {
+    File { source: Source, file: LocalFile },
+    Database { path: &'a Path, wal: &'a Path },
+}
+
+/// An item, and how many bytes of it the hub lacked when the scan compared them, or `None` when the hub had them all
+/// or the scan could not tell.
+struct Compared<'a> {
+    item: Item<'a>,
+    lacking: Option<u64>,
+}
+
+impl Compared<'_> {
+    fn name(&self) -> String {
+        match &self.item {
+            Item::File { file, .. } => file.locator.clone(),
+            Item::Database { path, .. } => path.display().to_string(),
+        }
+    }
+}
+
 struct Session<'a> {
     origin: &'a str,
     sources: &'a [Input],
+    report: &'a Reporter,
     sweep_every: Duration,
     watch: &'a mut Watch,
     /// What this process last left in step with the hub, by the path it read. It outlives the connection.
@@ -403,24 +433,25 @@ struct Session<'a> {
 }
 
 impl<'a> Session<'a> {
-    /// Connects, says hello, and loads the hub's state.
+    /// Says hello on a new connection, and loads the hub's state.
     fn start(
         options: &'a Options,
         sources: &'a [Input],
         watch: &'a mut Watch,
         synced: &'a mut HashMap<PathBuf, Synced>,
-        link: u64,
+        link: Link,
         events: &'a Receiver<Inbound>,
-        inbound: &Sender<Inbound>,
+        report: &'a Reporter,
     ) -> io::Result<Self> {
         let mut session = Self {
             origin: &options.origin,
             sources,
+            report,
             sweep_every: options.sweep,
             watch,
             synced,
             events,
-            link: Link::open(&options.hub, link, inbound)?,
+            link,
             states: HashMap::new(),
             unsent: HashMap::new(),
             next_sweep: Instant::now(),
@@ -457,21 +488,145 @@ impl<'a> Session<'a> {
                 other => return Err(unexpected(&other)),
             }
         }
-        eprintln!(
-            "collect: connected; the hub has {} streams from {}",
+        report.connected(&format!(
+            "connected; the hub has {} streams from {}",
             session.states.len(),
             session.origin
-        );
+        ));
         Ok(session)
     }
 
     /// Syncs every source, then sends changes as they happen. Returns the error that ended the connection.
     fn run(&mut self) -> io::Error {
+        // Set first, so that a rescan requested during the first sync can still move it earlier.
+        self.next_sweep = Instant::now() + self.sweep_every;
+        if let Err(error) = self.first_sync() {
+            return error;
+        }
+        self.swept = true;
         loop {
             if let Err(error) = self.step() {
                 return error;
             }
         }
+    }
+
+    /// Compares every file with the hub's confirmed state, then sends what the hub lacks. The totals it reports come
+    /// from that comparison, so that they are what this connection has to send.
+    fn first_sync(&mut self) -> io::Result<()> {
+        self.watch.ensure(self.report);
+        let compared = self.compare();
+        let lacking = compared.iter().filter_map(|compared| compared.lacking);
+        self.report
+            .first_sync(lacking.clone().count() as u64, lacking.sum());
+        for compared in &compared {
+            if let Some(bytes) = compared.lacking {
+                self.report.sending(&compared.name(), bytes);
+            }
+            match &compared.item {
+                Item::File { source, file } => self.sync_file(*source, file, Cause::Scan)?,
+                Item::Database { path, wal } => self.sync_database(path, wal, Cause::Scan)?,
+            }
+            if compared.lacking.is_some() {
+                self.report.sent_file();
+            }
+        }
+        self.report.live(compared.len() as u64);
+        Ok(())
+    }
+
+    /// Every file and database of every source, with what the hub lacks of each. One the hub has in full is
+    /// remembered as synced, as `sync_file` and `sync_database` would remember it, so the sync after skips it unread.
+    fn compare(&mut self) -> Vec<Compared<'a>> {
+        let mut compared = Vec::new();
+        let sources = self.sources;
+        for input in sources {
+            match input {
+                Input::Files { layout, root } => {
+                    let files = match layout.scan(root) {
+                        Ok(files) => files,
+                        Err(error) => {
+                            self.report
+                                .warn(format!("cannot scan {}: {error}", root.display()));
+                            continue;
+                        }
+                    };
+                    for file in files {
+                        let lacking = self.file_lacking(layout.source, &file);
+                        self.report.compared();
+                        compared.push(Compared {
+                            item: Item::File {
+                                source: layout.source,
+                                file,
+                            },
+                            lacking,
+                        });
+                    }
+                }
+                Input::Database { path, wal } => {
+                    let lacking = self.database_lacking(path, wal);
+                    self.report.compared();
+                    compared.push(Compared {
+                        item: Item::Database { path, wal },
+                        lacking,
+                    });
+                }
+            }
+        }
+        compared
+    }
+
+    /// The bytes of the file that the hub lacks. A file that cannot be read counts as none, and its sync reports why.
+    fn file_lacking(&mut self, source: Source, file: &LocalFile) -> Option<u64> {
+        let Ok(Some(stamp)) = stamp(&file.path) else {
+            return None;
+        };
+        let stamps = vec![Some(stamp)];
+        if self.unchanged(&file.path, &stamps)
+            || (file.write_mode == WriteMode::Replace
+                && stamp.len > u64::from(protocol::MAX_PAYLOAD_BYTES))
+        {
+            return None;
+        }
+        let key = StreamKey {
+            origin: self.origin.to_owned(),
+            source,
+            locator: file.locator.clone(),
+        };
+        let lacking = lacking(file, self.states.get(&key)).ok()?;
+        if lacking.is_none() {
+            self.remember(&file.path, stamps, vec![key]);
+        }
+        lacking
+    }
+
+    /// The bytes of the database's threads that the hub lacks, read as `sync_database` reads them.
+    fn database_lacking(&mut self, path: &Path, wal: &Path) -> Option<u64> {
+        let stamps = database_stamps(path, wal).ok()?;
+        if self.unchanged(path, &stamps) {
+            return None;
+        }
+        let threads = t3_code::snapshots(path).ok()?;
+        let (mut lacking, mut in_step) = (None, true);
+        let mut keys = Vec::with_capacity(threads.len());
+        for thread in threads {
+            let key = StreamKey {
+                origin: self.origin.to_owned(),
+                source: Source::T3Code,
+                locator: thread.locator,
+            };
+            let len = thread.bytes.len() as u64;
+            if len > u64::from(protocol::MAX_PAYLOAD_BYTES) {
+                in_step = false;
+            } else if plan_version(key.clone(), thread.bytes, self.states.get(&key)).is_some() {
+                *lacking.get_or_insert(0) += len;
+            }
+            keys.push(key);
+        }
+        if lacking.is_none() && in_step {
+            self.remember(path, stamps, keys);
+        }
+        lacking
     }
 
     fn step(&mut self) -> io::Result<()> {
@@ -499,7 +654,7 @@ impl<'a> Session<'a> {
                 }
                 Some(Target::Folder { layout, root }) => {
                     // The folder may be one that holds the source's files, such as Codex's archive, so watch it too.
-                    self.watch.ensure();
+                    self.watch.ensure(self.report);
                     self.sync_scan(layout.source, &path, layout.scan_under(root, &path))?;
                 }
                 Some(Target::Database { path, wal }) => {
@@ -531,37 +686,43 @@ impl<'a> Session<'a> {
     }
 
     fn sweep(&mut self) -> io::Result<()> {
-        self.watch.ensure();
+        self.watch.ensure(self.report);
         let sources = self.sources;
+        let mut files = 0;
         for input in sources {
             match input {
                 Input::Files { layout, root } => {
-                    self.sync_scan(layout.source, root, layout.scan(root))?;
+                    files += self.sync_scan(layout.source, root, layout.scan(root))?;
                 }
-                Input::Database { path, wal } => self.sync_database(path, wal, Cause::Scan)?,
+                Input::Database { path, wal } => {
+                    files += 1;
+                    self.sync_database(path, wal, Cause::Scan)?;
+                }
             }
         }
+        self.report.watching(files);
         Ok(())
     }
 
-    /// Syncs the files a scan of `dir` found.
+    /// Syncs the files a scan of `dir` found, and returns how many it found.
     fn sync_scan(
         &mut self,
         source: Source,
         dir: &Path,
         scan: io::Result<Vec<LocalFile>>,
-    ) -> io::Result<()> {
+    ) -> io::Result<u64> {
         let files = match scan {
             Ok(files) => files,
             Err(error) => {
-                eprintln!("collect: cannot scan {}: {error}", dir.display());
-                return Ok(());
+                self.report
+                    .warn(format!("cannot scan {}: {error}", dir.display()));
+                return Ok(0);
             }
         };
         for file in &files {
             self.sync_file(source, file, Cause::Scan)?;
         }
-        Ok(())
+        Ok(files.len() as u64)
     }
 
     /// Sends writes until the hub's copy of the file matches it. A problem with one file skips that file; a
@@ -575,7 +736,8 @@ impl<'a> Session<'a> {
                 return Ok(());
             }
             Err(error) => {
-                eprintln!("collect: skipping {}: {error}", file.locator);
+                self.report
+                    .warn(format!("skipping {}: {error}", file.locator));
                 return Ok(());
             }
         };
@@ -586,11 +748,11 @@ impl<'a> Session<'a> {
         if file.write_mode == WriteMode::Replace
             && stamp.len > u64::from(protocol::MAX_PAYLOAD_BYTES)
         {
-            eprintln!(
-                "collect: skipping {}: it is over the {}-byte limit",
+            self.report.warn(format!(
+                "skipping {}: it is over the {}-byte limit",
                 file.locator,
                 protocol::MAX_PAYLOAD_BYTES
-            );
+            ));
             return Ok(());
         }
         let key = StreamKey {
@@ -607,7 +769,8 @@ impl<'a> Session<'a> {
                     return Ok(());
                 }
                 Err(error) => {
-                    eprintln!("collect: skipping {}: {error}", file.locator);
+                    self.report
+                        .warn(format!("skipping {}: {error}", file.locator));
                     return Ok(());
                 }
             };
@@ -663,7 +826,8 @@ impl<'a> Session<'a> {
         let stamps = match database_stamps(path, wal) {
             Ok(stamps) => stamps,
             Err(error) => {
-                eprintln!("collect: cannot read {}: {error}", path.display());
+                self.report
+                    .warn(format!("cannot read {}: {error}", path.display()));
                 return Ok(());
             }
         };
@@ -674,7 +838,8 @@ impl<'a> Session<'a> {
         let threads = match t3_code::snapshots(path) {
             Ok(threads) => threads,
             Err(error) => {
-                eprintln!("collect: cannot read {}: {error}", path.display());
+                self.report
+                    .warn(format!("cannot read {}: {error}", path.display()));
                 return Ok(());
             }
         };
@@ -687,11 +852,11 @@ impl<'a> Session<'a> {
                 locator: thread.locator,
             };
             if thread.bytes.len() as u64 > u64::from(protocol::MAX_PAYLOAD_BYTES) {
-                eprintln!(
-                    "collect: skipping {}: it is over the {}-byte limit",
+                self.report.warn(format!(
+                    "skipping {}: it is over the {}-byte limit",
                     key.locator,
                     protocol::MAX_PAYLOAD_BYTES
-                );
+                ));
                 in_step = false;
             } else if let Some(write) =
                 plan_version(key.clone(), thread.bytes, self.states.get(&key))
@@ -713,23 +878,28 @@ impl<'a> Session<'a> {
     /// could not store the write.
     fn send(&mut self, write: Write) -> io::Result<Option<Applied>> {
         let key = write.key().clone();
+        let bytes = match &write {
+            Write::Segment { bytes, .. } | Write::Version { bytes, .. } => bytes.len() as u64,
+            Write::NewGeneration { .. } => 0,
+        };
         let (outcome, state) = match self.call(Request::Write(write))? {
             Response::Applied { outcome, state } => (outcome, state),
             // The hub could not store this write, for example because its disk is full. Other files may still fit.
             Response::Error { message } => {
-                eprintln!(
-                    "collect: the hub could not store {}: {message}",
+                self.report.warn(format!(
+                    "the hub could not store {}: {message}",
                     key.locator
-                );
+                ));
                 return Ok(None);
             }
             other => return Err(unexpected(&other)),
         };
-        if let Applied::Rejected(rejection) = outcome {
-            eprintln!(
-                "collect: the hub rejected a write to {}: {rejection:?}",
+        match outcome {
+            Applied::Rejected(rejection) => self.report.warn(format!(
+                "the hub rejected a write to {}: {rejection:?}",
                 key.locator
-            );
+            )),
+            _ => self.report.confirmed(&key.locator, bytes),
         }
         match state {
             Some(state) => self.states.insert(key, state),
@@ -793,7 +963,9 @@ impl<'a> Session<'a> {
         let event = match event {
             Ok(event) => event,
             Err(error) => {
-                eprintln!("collect: the watcher failed, so every source is swept soon: {error}");
+                self.report.warn(format!(
+                    "the watcher failed, so every source is swept soon: {error}"
+                ));
                 self.next_sweep = self.next_sweep.min(now + QUIET);
                 return;
             }

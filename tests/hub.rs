@@ -2,15 +2,16 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, BufReader, Write as _};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use prime_radiant::collect::{self, t3_code};
+use prime_radiant::index::Timestamp;
 use prime_radiant::protocol::{
-    self, Request, Response, Role, read_request, read_response, write_request,
+    self, Request, Response, Role, read_request, read_response, write_request, write_response,
 };
 use prime_radiant::query::{Ask, Find};
 use prime_radiant::raw::{Progress, RawRef, Sha256, Source, StreamKey, View, Write, WriteMode};
@@ -265,6 +266,68 @@ impl Setup {
         }
     }
 
+    /// The folder where every collector this test starts keeps its state.
+    fn state_dir(&self) -> PathBuf {
+        self.temp.path().join("prime-radiant")
+    }
+
+    /// The state file of the collector for `origin`, once it has written one.
+    fn collector_state(&self, origin: &str) -> Option<Value> {
+        let file = self.state_dir().join(format!("collect-{origin}.json"));
+        serde_json::from_slice(&fs::read(file).ok()?).ok()
+    }
+
+    /// Waits until the collector for `origin` reports `phase`, and returns its state.
+    fn wait_for_phase(&self, origin: &str, phase: &str) -> Value {
+        let deadline = Instant::now() + CONVERGE;
+        loop {
+            if let Some(state) = self.collector_state(origin)
+                && state["phase"]["name"] == phase
+            {
+                return state;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the collector reached {phase}, not {:?}",
+                self.collector_state(origin)
+            );
+            thread::sleep(POLL);
+        }
+    }
+
+    /// The stdout of `status` over this test's state folder, with `args`. No variable names a hub.
+    fn status(&self, args: &[&str]) -> String {
+        let out = self.temp.path().join("status.out");
+        let mut child = Command::new(BIN)
+            .args(["status", "--state-dir", path(&self.state_dir())])
+            .args(args)
+            .env_remove("PRIME_RADIANT_HUB")
+            .stdin(Stdio::null())
+            .stdout(File::create(&out).expect("status output file is created"))
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("the built binary starts");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let exit = loop {
+            if let Some(exit) = child.try_wait().expect("the child's status reads") {
+                break exit;
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("status {args:?} kept running");
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert!(exit.success(), "status {args:?} succeeds, not {exit}");
+        fs::read_to_string(out).expect("status output reads")
+    }
+
+    fn status_json(&self, args: &[&str]) -> Value {
+        let out = self.status(&[&["--json"], args].concat());
+        serde_json::from_str(&out).expect("status --json prints one JSON object")
+    }
+
     /// Every generation's segments start at 0, each starts where the last ended, and the current one ends at the
     /// confirmed offset, so no byte range is missing, overlapping, or stored twice.
     fn assert_segments_contiguous(&self) -> usize {
@@ -329,8 +392,10 @@ impl Proc {
             .append(true)
             .open(&log)
             .expect("log file opens");
+        // A collector keeps its state under XDG_STATE_HOME, so each test's stays in its own folder.
         let child = Command::new(BIN)
             .args(args)
+            .env("XDG_STATE_HOME", logs)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(stderr)
@@ -1592,4 +1657,361 @@ fn changes_made_while_the_hub_is_down_reach_it_once_it_is_back() {
     fs::remove_dir_all(&setup.data).expect("the hub's data is removed");
     let _hub = setup.hub();
     setup.wait_until_synced(ORIGIN, &sources);
+}
+
+/// The number of files and the bytes in all under the sources, which is what an empty hub lacks.
+fn local_totals(sources: &[(Source, PathBuf)]) -> (u64, u64) {
+    let copies = source_copies(sources);
+    let bytes = copies.values().map(|bytes| bytes.len() as u64).sum();
+    (copies.len() as u64, bytes)
+}
+
+fn time(value: &Value) -> Timestamp {
+    value
+        .as_str()
+        .and_then(Timestamp::parse_utc)
+        .unwrap_or_else(|| panic!("{value} is a UTC time"))
+}
+
+#[test]
+fn the_state_file_shows_the_first_sync_rising_then_live_at_100_percent() {
+    let setup = Setup::new();
+    let root = setup.fixture_root("projects");
+    write_transcript(
+        &root,
+        "-home-dev-generated-project",
+        LARGE_ID,
+        LARGE_BYTES,
+        "build cache",
+    );
+    let (files, bytes) = local_totals(&claude_code(&root));
+    let _hub = setup.hub();
+    let _collector = setup.collector("collector", ORIGIN, &root, &setup.bridge_command());
+
+    let deadline = Instant::now() + CONVERGE;
+    let mut done = Vec::new();
+    let live = loop {
+        let state = setup.collector_state(ORIGIN).unwrap_or_default();
+        match state["phase"]["name"].as_str() {
+            Some("first_sync") => {
+                let progress = &state["phase"]["progress"];
+                assert_eq!(
+                    progress["bytes_total"], bytes,
+                    "the first sync is to send every byte the empty hub lacks"
+                );
+                assert_eq!(progress["files_total"], files);
+                let confirmed = progress["bytes_done"]
+                    .as_u64()
+                    .expect("bytes done is a count");
+                if done.last() != Some(&confirmed) {
+                    done.push(confirmed);
+                }
+            }
+            Some("live") => break state,
+            _ => {}
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the collector went live; the first sync showed {done:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        done.windows(2).all(|pair| pair[0] < pair[1]),
+        "bytes done only rose: {done:?}"
+    );
+    assert!(
+        done.iter()
+            .any(|&confirmed| confirmed > 0 && confirmed < bytes),
+        "the state file showed the first sync part way through, not only {done:?}"
+    );
+    let first_sync = &live["phase"]["first_sync"];
+    assert_eq!(
+        (&first_sync["bytes_done"], &first_sync["bytes_total"]),
+        (&json!(bytes), &json!(bytes)),
+        "the first sync ended at 100%"
+    );
+    assert_eq!(
+        (&first_sync["files_done"], &first_sync["files_total"]),
+        (&json!(files), &json!(files))
+    );
+    assert_eq!(live["phase"]["files"], files, "live watches every file");
+    assert_eq!(live["sent_bytes"], bytes);
+}
+
+#[test]
+fn a_service_log_gets_a_line_for_each_phase() {
+    let setup = Setup::new();
+    let root = setup.fixture_root("projects");
+    let _hub = setup.hub();
+    let collector = setup.collector("collector", ORIGIN, &root, &setup.bridge_command());
+    setup.wait_for_phase(ORIGIN, "live");
+
+    let log = fs::read_to_string(&collector.log).expect("the collector's log reads");
+    let (files, _) = local_totals(&claude_code(&root));
+    let lines = [
+        format!("collect: {ORIGIN} · connecting to the hub"),
+        format!("collect: {ORIGIN} · scanning"),
+        format!("collect: {ORIGIN} · first sync 0%"),
+        format!("collect: {ORIGIN} · live · watching {files} files"),
+    ];
+    let mut rest = log.as_str();
+    for line in &lines {
+        let at = rest
+            .find(line.as_str())
+            .unwrap_or_else(|| panic!("the log has {line:?} after the lines before it:\n{log}"));
+        rest = &rest[at + line.len()..];
+    }
+    assert!(
+        !log.contains('\r'),
+        "a log that is not a terminal gets whole lines, not redraws:\n{log}"
+    );
+}
+
+#[test]
+fn a_killed_hub_shows_the_collector_reconnecting_with_a_retry_time() {
+    let setup = Setup::new();
+    let root = setup.fixture_root("projects");
+    let mut hub = setup.hub();
+    let _collector = setup.collector("collector", ORIGIN, &root, &setup.bridge_command());
+    setup.wait_for_phase(ORIGIN, "live");
+
+    hub.kill();
+    let state = setup.wait_for_phase(ORIGIN, "reconnecting");
+    let phase = &state["phase"];
+    assert!(
+        time(&phase["retry_at"]) >= time(&state["updated_at"]),
+        "the next try is still ahead in {state}"
+    );
+    assert!(
+        phase["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()),
+        "the state says why: {state}"
+    );
+    let status = setup.status_json(&["--hub-socket", path(&setup.data.join("hub.sock"))]);
+    let collector = &status["collectors"][0];
+    assert_eq!(collector["running"], true);
+    assert_eq!(collector["state"]["phase"]["name"], "reconnecting");
+    assert!(
+        status["hub"]["unavailable"]
+            .as_str()
+            .is_some_and(|why| why.contains("cannot reach the hub")),
+        "status says why the hub part is missing: {status}"
+    );
+
+    let _hub = setup.hub();
+    setup.wait_for_phase(ORIGIN, "live");
+}
+
+#[test]
+fn a_killed_collector_shows_as_stopped_with_when_it_was_last_seen() {
+    let setup = Setup::new();
+    let root = setup.fixture_root("projects");
+    let _hub = setup.hub();
+    let mut collector = setup.collector("collector", ORIGIN, &root, &setup.bridge_command());
+    setup.wait_for_phase(ORIGIN, "live");
+    let pid = collector.child.id();
+    collector.kill();
+
+    let text = setup.status(&[]);
+    assert!(
+        text.contains(&format!("{ORIGIN}: stopped, last seen ")),
+        "status shows the collector stopped:\n{text}"
+    );
+    assert!(
+        text.contains("when last seen: live · watching"),
+        "status shows what it was doing:\n{text}"
+    );
+    assert!(
+        text.contains("hub: unavailable: no hub to ask"),
+        "status says why the hub part is missing:\n{text}"
+    );
+    let status = setup.status_json(&[]);
+    let collector = &status["collectors"][0];
+    assert_eq!(collector["running"], false);
+    assert_eq!(collector["state"]["pid"], pid);
+    assert_eq!(collector["state"]["phase"]["name"], "live");
+}
+
+#[test]
+fn status_reports_what_the_hub_holds_from_each_origin_and_its_last_write() {
+    let setup = Setup::new();
+    let root = setup.fixture_root("projects");
+    let started = Timestamp(Timestamp::now().0 / 1000 * 1000);
+    let mut hub = setup.hub();
+    let mut collector = setup.collector("collector", ORIGIN, &root, &setup.bridge_command());
+    setup.wait_until_copied(ORIGIN, &root);
+    let (files, bytes) = local_totals(&claude_code(&root));
+
+    let status = setup.status_json(&["--hub-socket", path(&setup.data.join("hub.sock"))]);
+    let origins = status["hub"]["origins"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the hub answers with its origins: {status}"));
+    assert_eq!(origins.len(), 1, "one origin wrote: {status}");
+    let origin = &origins[0];
+    assert_eq!(
+        (
+            &origin["origin"],
+            &origin["streams"],
+            &origin["confirmed_bytes"]
+        ),
+        (&json!(ORIGIN), &json!(files), &json!(bytes)),
+        "the hub holds one stream per file, every byte confirmed"
+    );
+    let last_write = time(&origin["last_write"]);
+    assert!(
+        started <= last_write && last_write <= Timestamp::now(),
+        "the last write was during this test: {origin}"
+    );
+
+    collector.kill();
+    hub.kill();
+    let _hub = setup.hub();
+    let status = setup.status_json(&["--data", path(&setup.data)]);
+    let origin = &status["hub"]["origins"][0];
+    assert_eq!(
+        (
+            &origin["streams"],
+            &origin["confirmed_bytes"],
+            &origin["last_write"]
+        ),
+        (&json!(files), &json!(bytes), &Value::Null),
+        "a restarted hub keeps the streams and has seen no write: {status}"
+    );
+    let text = setup.status(&["--data", path(&setup.data)]);
+    assert!(
+        text.contains(&format!("{ORIGIN}: {files} streams"))
+            && text.contains("no write since the hub started"),
+        "status says so:\n{text}"
+    );
+}
+
+#[test]
+fn status_tells_an_older_or_silent_hub_apart_and_does_not_wait_forever() {
+    let setup = Setup::new();
+    let socket = setup.temp.path().join("older-hub.sock");
+    let listener = UnixListener::bind(&socket).expect("the stand-in hub listens");
+    // A hub from before the origins question answers hello, then fails to decode the question and closes.
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut reader = BufReader::new(stream.try_clone().expect("socket clones"));
+            let _ = read_request(&mut reader);
+            let hello = Response::Hello {
+                protocol: protocol::VERSION,
+            };
+            let refusal = Response::Error {
+                message: "bad frame: unknown variant `origins`, expected one of `hello`, `state`, `write`, `find`, `brief`, `stats`, `read`, `grep`".to_owned(),
+            };
+            let _ = write_response(&mut stream, &hello);
+            let _ = write_response(&mut stream, &refusal);
+        }
+    });
+    let status = setup.status_json(&["--hub-socket", path(&socket)]);
+    assert!(
+        status["hub"]["unavailable"]
+            .as_str()
+            .is_some_and(|why| why.contains("older than this client")),
+        "status names an older hub as the likely cause: {status}"
+    );
+
+    let socket = setup.temp.path().join("silent-hub.sock");
+    let listener = UnixListener::bind(&socket).expect("the stand-in hub listens");
+    // Accepts and keeps each connection open, and never answers.
+    thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            held.push(stream);
+        }
+    });
+    let start = Instant::now();
+    let status = setup.status_json(&["--hub-socket", path(&socket)]);
+    assert!(
+        start.elapsed() < Duration::from_secs(20),
+        "status gave up on a silent hub after {:?}",
+        start.elapsed()
+    );
+    assert!(
+        status["hub"]["unavailable"]
+            .as_str()
+            .is_some_and(|why| why.contains("has not answered")),
+        "status says the hub did not answer: {status}"
+    );
+}
+
+#[test]
+fn a_restarted_collector_counts_only_what_the_hub_lacks() {
+    let setup = Setup::new();
+    let root = setup.fixture_root("projects");
+    let large = write_transcript(
+        &root,
+        "-home-dev-generated-project",
+        LARGE_ID,
+        LARGE_BYTES,
+        "build cache",
+    );
+    let len = fs::metadata(root.join(&large))
+        .expect("transcript exists")
+        .len();
+    let (files, bytes) = local_totals(&claude_code(&root));
+    let _hub = setup.hub();
+    let mut collector = setup.collector("collector", ORIGIN, &root, &setup.bridge_command());
+    setup.wait_for_partial(&large, len);
+    collector.kill();
+
+    let status = setup.status_json(&["--hub-socket", path(&setup.data.join("hub.sock"))]);
+    let held = status["hub"]["origins"][0]["confirmed_bytes"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the hub holds part of the origin: {status}"));
+    assert!(
+        0 < held && held < bytes,
+        "the hub holds {held} of {bytes} bytes"
+    );
+    let restarted = setup.collector(
+        "collector-restarted",
+        ORIGIN,
+        &root,
+        &setup.bridge_command(),
+    );
+    let pid = restarted.child.id();
+
+    let deadline = Instant::now() + CONVERGE;
+    let mut totals = Vec::new();
+    let live = loop {
+        let state = setup.collector_state(ORIGIN).unwrap_or_default();
+        match state["phase"]["name"].as_str() {
+            _ if state["pid"] != pid => {}
+            Some("first_sync") => {
+                let progress = &state["phase"]["progress"];
+                totals.push((
+                    progress["bytes_total"].clone(),
+                    progress["files_total"].clone(),
+                ));
+            }
+            Some("live") => break state,
+            _ => {}
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the restarted collector went live"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        !totals.is_empty(),
+        "the state file showed the restarted collector's first sync"
+    );
+    for (total, file_count) in &totals {
+        assert_eq!(
+            total,
+            &json!(bytes - held),
+            "the first sync counts only the bytes the hub lacked"
+        );
+        assert!(
+            file_count.as_u64() < Some(files),
+            "it leaves out the files the hub already had, but counts {file_count} of {files}"
+        );
+    }
+    assert_eq!(live["phase"]["first_sync"]["bytes_done"], bytes - held);
 }

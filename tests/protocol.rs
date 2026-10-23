@@ -2,8 +2,8 @@ use std::io::{self, Cursor};
 
 use prime_radiant::index::Timestamp;
 use prime_radiant::protocol::{
-    self, MAX_PAYLOAD_BYTES, Request, Response, Role, read_request, read_response, write_request,
-    write_response,
+    self, MAX_PAYLOAD_BYTES, OriginStats, Request, Response, Role, read_request, read_response,
+    write_request, write_response,
 };
 use prime_radiant::query::{Ask, Filters, Find};
 use prime_radiant::raw::{
@@ -91,6 +91,7 @@ fn every_request_survives_a_round_trip() {
             pattern: "json flag".to_owned(),
         }),
         Request::Ask(Ask::Stats),
+        Request::Origins,
     ];
     let frames: Vec<u8> = requests.iter().flat_map(encode_request).collect();
     assert_eq!(
@@ -261,6 +262,22 @@ fn every_response_survives_a_round_trip() {
         },
         Response::Found {
             hits: json!([{"key": "claude-code/x"}]),
+        },
+        Response::Origins {
+            origins: vec![
+                OriginStats {
+                    origin: "example-origin".to_owned(),
+                    streams: 3,
+                    confirmed_bytes: 4096,
+                    last_write: Some(Timestamp(1_768_471_200_000)),
+                },
+                OriginStats {
+                    origin: "other-origin".to_owned(),
+                    streams: 1,
+                    confirmed_bytes: 0,
+                    last_write: None,
+                },
+            ],
         },
         Response::Error {
             message: "the first request must be hello".to_owned(),

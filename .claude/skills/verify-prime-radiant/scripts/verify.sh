@@ -10,6 +10,9 @@ verify.sh doctor RUN                   check the instance is ours, current, and 
 verify.sh cli RUN LABEL ARGS...        run prime-radiant ARGS, record it as evidence
                                        (@RUN@, @SOCK@, @DATA@, @SESSIONS@, @BIN@ in ARGS are replaced)
 verify.sh collector RUN start|stop|crash  run a collector over the fixture copies; crash is SIGKILL
+                                       (its state file is RUN/state/collect-verify.json)
+verify.sh hub RUN stop|start           stop the hub this run started, or start it again on the same data
+verify.sh big-session RUN MIB          add a made-up transcript of about MIB mebibytes to the Claude Code copy
 verify.sh append RUN TEXT              append a user line with TEXT to the fixture transcript copy
 verify.sh token                        print a fresh one-word token, such as quokka3f9a1c2e
 verify.sh wait-find RUN TOKEN [SECS]   poll find TOKEN through the hub until a hit quotes it; record the time
@@ -48,18 +51,36 @@ EVIDENCE='$evidence'
 COMMIT='$(git -C "$root" rev-parse HEAD)'
 EOF
   load "$run"
-  nohup "$BIN" hub serve --data "$DATA" >"$RUN/hub.log" 2>&1 &
+  start_hub
+  echo "RUN=$RUN"
+  echo "EVIDENCE=$EVIDENCE"
+}
+
+start_hub() {
+  nohup "$BIN" hub serve --data "$DATA" >>"$RUN/hub.log" 2>&1 &
   echo $! >"$RUN/hub.pid"
   for _ in $(seq 50); do
     if "$BIN" stats --hub-socket "$SOCK" --json >/dev/null 2>&1; then
-      echo "RUN=$RUN"
-      echo "EVIDENCE=$EVIDENCE"
       return
     fi
     sleep 0.2
   done
   echo "hub did not answer within 10 s; see $RUN/hub.log" >&2
   exit 1
+}
+
+hub() {
+  load "$1"
+  case $2 in
+    start) alive "$RUN/hub.pid" || start_hub ;;
+    stop)
+      if alive "$RUN/hub.pid" && ps -o command= -p "$(cat "$RUN/hub.pid")" | grep -q -- "$RUN"; then
+        kill "$(cat "$RUN/hub.pid")"
+      fi
+      rm -f "$RUN/hub.pid"
+      ;;
+    *) usage; exit 2 ;;
+  esac
 }
 
 doctor() {
@@ -108,7 +129,7 @@ collector() {
     start)
       nohup "$BIN" collect --origin verify --hub-socket "$SOCK" --sweep-seconds 5 \
         --claude-code "$SESSIONS/claude-code" --codex "$SESSIONS/codex" --grok "$SESSIONS/grok" \
-        >"$RUN/collector.log" 2>&1 &
+        --state-file "$RUN/state/collect-verify.json" >>"$RUN/collector.log" 2>&1 &
       echo $! >"$RUN/collector.pid"
       ;;
     stop | crash)
@@ -138,6 +159,29 @@ with open(path, "a") as f:
 EOF
   date +%s.%N >"$RUN/appended-at"
   echo "appended to $transcript"
+}
+
+big_session() {
+  load "$1"
+  python3 - "$SESSIONS/claude-code/-home-dev-generated-project" "$2" <<'EOF'
+import json, os, sys, uuid
+folder, mib = sys.argv[1], int(sys.argv[2])
+os.makedirs(folder, exist_ok=True)
+session = str(uuid.uuid4())
+filler = "lorem ipsum dolor sit amet " * 600
+path = os.path.join(folder, session + ".jsonl")
+with open(path, "w") as f:
+    f.write(json.dumps({"type": "user", "sessionId": session, "uuid": str(uuid.uuid4()), "parentUuid": None,
+                        "cwd": "/home/dev/generated-project", "timestamp": "2026-03-01T09:00:00.000Z",
+                        "message": {"role": "user", "content": "A made-up request for a large session."}}) + "\n")
+    size, n = 0, 0
+    while size < mib << 20:
+        n += 1
+        line = json.dumps({"type": "progress", "sessionId": session, "data": "step %d %s" % (n, filler)}) + "\n"
+        f.write(line)
+        size += len(line)
+print("wrote %d bytes to %s" % (os.path.getsize(path), path))
+EOF
 }
 
 wait_find() {
@@ -178,6 +222,8 @@ case ${1:-} in
   doctor) doctor "$2" ;;
   cli) shift; cli "$@" ;;
   collector) collector "$2" "$3" ;;
+  hub) hub "$2" "$3" ;;
+  big-session) big_session "$2" "$3" ;;
   append) append "$2" "$3" ;;
   wait-find) wait_find "$2" "$3" "${4:-30}" ;;
   token) echo "quokka$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')" ;;

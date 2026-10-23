@@ -672,6 +672,15 @@ impl Store {
     }
 }
 
+/// The streams of one origin, and the bytes of their current copies: an append stream's confirmed bytes, and a replace
+/// stream's latest version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OriginTotals {
+    pub origin: String,
+    pub streams: u64,
+    pub confirmed_bytes: u64,
+}
+
 /// A read-only view of the raw layer. Any number can be open beside the one `Store`.
 pub struct View {
     dir: PathBuf,
@@ -717,6 +726,33 @@ impl View {
 
     pub fn version(&self, sha256: Sha256) -> Result<Vec<u8>> {
         Ok(fs::read(blob_path(&self.dir, sha256))?)
+    }
+
+    /// Each origin's stream count and the bytes of its streams' current copies, by origin.
+    pub fn origins(&self) -> Result<Vec<OriginTotals>> {
+        let mut totals: Vec<OriginTotals> = Vec::new();
+        for stream in self.streams()? {
+            let bytes = match stream.state.progress {
+                Progress::Append {
+                    confirmed_offset, ..
+                } => confirmed_offset,
+                Progress::Replace { latest_checksum } => {
+                    fs::metadata(blob_path(&self.dir, latest_checksum))?.len()
+                }
+            };
+            match totals.last_mut() {
+                Some(last) if last.origin == stream.key.origin => {
+                    last.streams += 1;
+                    last.confirmed_bytes += bytes;
+                }
+                _ => totals.push(OriginTotals {
+                    origin: stream.key.origin,
+                    streams: 1,
+                    confirmed_bytes: bytes,
+                }),
+            }
+        }
+        Ok(totals)
     }
 
     /// Row counts of streams, segments, and versions.

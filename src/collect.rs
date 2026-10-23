@@ -2,6 +2,7 @@ pub mod claude_code;
 pub mod codex;
 pub mod grok;
 pub mod live;
+pub mod progress;
 pub mod t3_code;
 
 use std::collections::HashMap;
@@ -220,6 +221,30 @@ pub fn next_write(
     }
 }
 
+/// How many bytes of the file the hub lacks, given its stream's confirmed state, or `None` when `next_write` would
+/// plan nothing. Reads the head of an append file, and a replace file only when the hub has a version to compare.
+pub fn lacking(file: &LocalFile, state: Option<&StreamState>) -> io::Result<Option<u64>> {
+    if file.write_mode == WriteMode::Replace {
+        if !matches!(
+            state,
+            Some(StreamState {
+                progress: Progress::Replace { .. },
+                ..
+            })
+        ) {
+            return Ok(Some(fs::metadata(&file.path)?.len()));
+        }
+        let bytes = fs::read(&file.path)?;
+        return Ok((!is_latest(state, Sha256::of(&bytes))).then_some(bytes.len() as u64));
+    }
+    let mut handle = File::open(&file.path)?;
+    let len = handle.metadata()?.len();
+    Ok(match resume(&mut handle, state)? {
+        Resume::At { offset, .. } => (len > offset).then(|| len - offset),
+        Resume::NewGeneration { .. } => Some(len),
+    })
+}
+
 /// Where an append stream's next bytes go.
 enum Resume {
     At {
@@ -299,11 +324,15 @@ fn replace_write(
 /// A version of a replace stream, unless the raw layer already has these bytes as its latest.
 pub fn plan_version(key: StreamKey, bytes: Vec<u8>, state: Option<&StreamState>) -> Option<Write> {
     let sha256 = Sha256::of(&bytes);
-    let unchanged = matches!(
+    (!is_latest(state, sha256)).then_some(Write::Version { key, sha256, bytes })
+}
+
+/// Whether the raw layer's latest version of a replace stream has this checksum.
+fn is_latest(state: Option<&StreamState>, sha256: Sha256) -> bool {
+    matches!(
         state,
         Some(StreamState { progress: Progress::Replace { latest_checksum }, .. }) if *latest_checksum == sha256
-    );
-    (!unchanged).then_some(Write::Version { key, sha256, bytes })
+    )
 }
 
 pub fn import_claude_code(root: &Path, origin: &str, store: &mut Store) -> Result<ImportSummary> {

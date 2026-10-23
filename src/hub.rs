@@ -5,6 +5,7 @@
 //! rebuild a brief, which the indexer then stores. Each connection gets a thread that parses requests and hands them
 //! to the owner.
 
+use std::collections::HashMap;
 use std::fs::{self, DirBuilder, Permissions};
 use std::io::{self, BufReader, BufWriter, Read, Write as _};
 use std::net::Shutdown;
@@ -14,12 +15,12 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::index::{Indexer, Timestamp};
-use crate::protocol::{self, Request, Response, Role};
+use crate::protocol::{self, OriginStats, Request, Response, Role};
 use crate::query::{Answer, Ask, Query};
-use crate::raw::{Applied, Source, Store, StreamKey, StreamState, Write};
+use crate::raw::{Applied, Source, Store, StreamKey, StreamState, View, Write};
 use crate::{Error, Result};
 
 /// How long the index waits after a write for more writes before it syncs.
@@ -57,6 +58,7 @@ pub fn serve(dir: &Path) -> Result<()> {
     let owners = Owners {
         intake,
         index: index.clone(),
+        dir: dir.to_owned(),
     };
     thread::Builder::new()
         .name("accept".to_owned())
@@ -104,6 +106,10 @@ enum Intake {
         write: Write,
         reply: Sender<Result<(Applied, Option<StreamState>)>>,
     },
+    /// When the hub last stored a write from each origin since it started.
+    LastWrites {
+        reply: Sender<HashMap<String, Timestamp>>,
+    },
 }
 
 enum Index {
@@ -119,6 +125,8 @@ enum Index {
 struct Owners {
     intake: Sender<Intake>,
     index: Sender<Index>,
+    /// The data directory, which a connection reads through its own `View`.
+    dir: PathBuf,
 }
 
 /// Runs one step of an owner thread, turning a panic into an error, so that a bug that one stream or one request
@@ -131,6 +139,7 @@ fn guard<T>(what: &str, step: impl FnOnce() -> Result<T>) -> Result<T> {
 
 /// Applies writes one at a time. Returns only if the index thread stopped, which ends the hub.
 fn run_intake(mut store: Store, commands: Receiver<Intake>, index: Sender<Index>) -> Result<()> {
+    let mut last_writes = HashMap::new();
     for command in commands {
         match command {
             Intake::State {
@@ -163,11 +172,17 @@ fn run_intake(mut store: Store, commands: Receiver<Intake>, index: Sender<Index>
                         _
                     ))
                 );
+                if changed {
+                    last_writes.insert(write.key().origin.clone(), Timestamp::now());
+                }
                 // Before the reply, so that a query sent after the confirmation finds the index due for a sync.
                 if changed && index.send(Index::Changed).is_err() {
                     return Err(Error::Internal("the index thread stopped".to_owned()));
                 }
                 let _ = reply.send(result);
+            }
+            Intake::LastWrites { reply } => {
+                let _ = reply.send(last_writes.clone());
             }
         }
     }
@@ -241,12 +256,7 @@ fn sync(indexer: &mut Indexer, timer: &mut SyncTimer) {
 /// Answers from a fresh read-only view of the index, and stores a brief the answer rebuilt, so that the index thread's
 /// indexer stays the only writer of `index.db`.
 fn answer(dir: &Path, indexer: &mut Indexer, ask: Ask) -> Result<Response> {
-    let now = Timestamp(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |since| since.as_millis() as i64),
-    );
-    let answer = Query::open(dir, now)?.answer(ask)?;
+    let answer = Query::open(dir, Timestamp::now())?.answer(ask)?;
     if let Answer::Brief(brief) = &answer
         && brief.freshness.rebuilt
     {
@@ -373,7 +383,29 @@ fn respond(peer: &mut Option<Peer>, request: Request, owners: &Owners) -> Reply 
             reply,
         })
         .map_or_else(stopped, reply),
+        Request::Origins => origins(owners),
     }
+}
+
+/// Reads the totals through this connection's own view, so that the intake thread only hands over the times.
+fn origins(owners: &Owners) -> Reply {
+    let Some(last_writes) = ask(&owners.intake, |reply| Intake::LastWrites { reply }) else {
+        return stopped();
+    };
+    let totals = View::open(&owners.dir).and_then(|view| view.origins());
+    reply(totals.map(|totals| {
+        Response::Origins {
+            origins: totals
+                .into_iter()
+                .map(|totals| OriginStats {
+                    last_write: last_writes.get(&totals.origin).copied(),
+                    origin: totals.origin,
+                    streams: totals.streams,
+                    confirmed_bytes: totals.confirmed_bytes,
+                })
+                .collect(),
+        }
+    }))
 }
 
 /// Sends a command to an owner thread and waits for its answer, or `None` if the owner stopped.

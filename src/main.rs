@@ -2,14 +2,15 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use clap::{Args, Parser, Subcommand};
+use clap::builder::{PossibleValuesParser, TypedValueParser};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use prime_radiant::client::{self, HubAddress};
 use prime_radiant::collect::live;
 use prime_radiant::collect::{import_claude_code, import_codex, import_grok, import_t3_code};
 use prime_radiant::hub;
 use prime_radiant::index::{Indexer, Timestamp};
 use prime_radiant::protocol::Request;
-use prime_radiant::query::{Answer, Ask, Brief, Hit, ParentKind, Query, Stats};
+use prime_radiant::query::{Answer, Ask, Brief, Filters, Find, Hit, ParentKind, Query, Stats};
 use prime_radiant::raw::{Source, Store};
 use prime_radiant::transcript::{Matches, Page};
 use serde::Serialize;
@@ -17,6 +18,7 @@ use serde::Serialize;
 const WIDTH: usize = 100;
 /// A hub command for query commands given no `--data`, `--hub-socket`, or `--hub-command`.
 const HUB_ENV: &str = "PRIME_RADIANT_HUB";
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
 #[derive(Parser)]
 #[command(
@@ -49,14 +51,36 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Find sessions by ID, alias, ID prefix, or words about the topic.
+    /// Find sessions by ID, alias, ID prefix, words about the topic, or exact phrases.
+    #[command(group = ArgGroup::new("search").required(true).multiple(true).args(["query", "phrases"]))]
     Find {
-        #[arg(required = true, num_args = 1..)]
+        /// Words about the topic, or a session key, an alias, or a unique ID prefix of 8 or more characters.
+        #[arg(num_args = 1..)]
         query: Vec<String>,
+        /// Only sessions with this text in one message or the title, its words adjacent and in order. Repeat to require several.
+        #[arg(long = "phrase", value_name = "TEXT")]
+        phrases: Vec<String>,
+        /// Only sessions from this harness. Repeat for any of several.
+        #[arg(long = "source", value_name = "SOURCE", value_parser = source())]
+        sources: Vec<Source>,
+        /// Only sessions that ran on this machine or account. Repeat for any of several.
+        #[arg(long = "origin", value_name = "NAME")]
+        origins: Vec<String>,
+        /// Only sessions whose project path contains this text, ignoring case.
+        #[arg(long, value_name = "TEXT")]
+        project: Option<String>,
+        /// Only sessions last active on or after this day (YYYY-MM-DD, in UTC) or RFC 3339 time.
+        #[arg(long, value_name = "DATE", value_parser = since)]
+        since: Option<Timestamp>,
+        /// Only sessions last active on or before this day (YYYY-MM-DD, in UTC) or RFC 3339 time.
+        #[arg(long, value_name = "DATE", value_parser = until)]
+        until: Option<Timestamp>,
         #[command(flatten)]
         target: Target,
+        /// Print the hits as JSON.
         #[arg(long)]
         json: bool,
+        /// The most sessions to print.
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
@@ -261,14 +285,28 @@ fn run(command: Command) -> prime_radiant::Result<()> {
         Command::Stats { target, json } => query(target, Ask::Stats, json),
         Command::Find {
             query: words,
+            phrases,
+            sources,
+            origins,
+            project,
+            since,
+            until,
             target,
             json,
             limit,
         } => {
-            let ask = Ask::Find {
+            let ask = Ask::Find(Find {
                 query: words.join(" "),
+                phrases,
+                filters: Filters {
+                    sources,
+                    origins,
+                    project,
+                    since,
+                    until,
+                },
                 limit,
-            };
+            });
             query(target, ask, json)
         }
         Command::Brief {
@@ -373,6 +411,41 @@ fn import(data: &Path, origin: &str, sources: Vec<(Source, PathBuf)>) -> prime_r
         synced.messages_indexed, synced.streams_synced
     );
     Ok(())
+}
+
+fn source() -> impl TypedValueParser<Value = Source> {
+    let names = [
+        Source::ClaudeCode,
+        Source::Codex,
+        Source::Grok,
+        Source::T3Code,
+    ]
+    .map(Source::as_str);
+    PossibleValuesParser::new(names)
+        .map(|name| Source::parse(&name).expect("clap allows only source names"))
+}
+
+fn since(text: &str) -> Result<Timestamp, String> {
+    day_or_time(text).map(|(first, _)| first)
+}
+
+fn until(text: &str) -> Result<Timestamp, String> {
+    day_or_time(text).map(|(_, last)| last)
+}
+
+/// The first and last millisecond of a UTC day, `YYYY-MM-DD`, or an RFC 3339 time twice.
+fn day_or_time(text: &str) -> Result<(Timestamp, Timestamp), String> {
+    if text.len() == 10
+        && let Some(start) = Timestamp::parse_rfc3339(&format!("{text}T00:00:00Z"))
+    {
+        return Ok((start, Timestamp(start.0 + DAY_MS - 1)));
+    }
+    Timestamp::parse_rfc3339(text)
+        .map(|at| (at, at))
+        .ok_or_else(|| {
+            "expected a day such as 2026-01-15, or an RFC 3339 time such as 2026-01-15T09:30:00Z"
+                .to_owned()
+        })
 }
 
 fn now() -> Timestamp {

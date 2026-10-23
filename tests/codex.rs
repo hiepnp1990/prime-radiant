@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use prime_radiant::collect::{self, import_codex};
 use prime_radiant::index::{self, Cuts, Indexer, SyncSummary, Timestamp};
-use prime_radiant::query::{Brief, ParentKind, Query};
+use prime_radiant::query::{Brief, Find, ParentKind, Query};
 use prime_radiant::raw::{RawRef, Sha256, Source, Store, StreamId, View, WriteMode};
 use rusqlite::Connection;
 use serde_json::Value;
@@ -141,7 +141,11 @@ impl Setup {
 
     fn find(&self, words: &str) -> Vec<String> {
         self.query()
-            .find(words, 10)
+            .find(&Find {
+                query: words.to_owned(),
+                limit: 10,
+                ..Find::default()
+            })
             .expect("find runs")
             .into_iter()
             .map(|hit| hit.key)

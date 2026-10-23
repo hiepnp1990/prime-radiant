@@ -12,7 +12,7 @@ use prime_radiant::collect::{self, t3_code};
 use prime_radiant::protocol::{
     self, Request, Response, Role, read_request, read_response, write_request,
 };
-use prime_radiant::query::Ask;
+use prime_radiant::query::{Ask, Find};
 use prime_radiant::raw::{Progress, RawRef, Sha256, Source, StreamKey, View, Write, WriteMode};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Value, json};
@@ -418,10 +418,11 @@ impl Client {
     }
 
     fn find_keys(&mut self, query: &str) -> Vec<String> {
-        let request = Request::Ask(Ask::Find {
+        let request = Request::Ask(Ask::Find(Find {
             query: query.to_owned(),
             limit: 10,
-        });
+            ..Find::default()
+        }));
         match self.call(request) {
             Some(Response::Found {
                 hits: Value::Array(hits),

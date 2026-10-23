@@ -1,10 +1,11 @@
 use std::io::{self, Cursor};
 
+use prime_radiant::index::Timestamp;
 use prime_radiant::protocol::{
     self, MAX_PAYLOAD_BYTES, Request, Response, Role, read_request, read_response, write_request,
     write_response,
 };
-use prime_radiant::query::Ask;
+use prime_radiant::query::{Ask, Filters, Find};
 use prime_radiant::raw::{
     Applied, HeadCheck, Progress, Rejection, Sha256, Source, StreamKey, StreamState, Write,
 };
@@ -72,10 +73,12 @@ fn every_request_survives_a_round_trip() {
             key: key(),
             generation: 3,
         }),
-        Request::Ask(Ask::Find {
+        Request::Ask(Ask::Find(Find {
             query: "json flag".to_owned(),
             limit: 10,
-        }),
+            ..Find::default()
+        })),
+        Request::Ask(Ask::Find(filtered_find())),
         Request::Ask(Ask::Brief {
             session: "33831ab7".to_owned(),
         }),
@@ -94,6 +97,66 @@ fn every_request_survives_a_round_trip() {
         decode_requests(&frames),
         requests,
         "back-to-back frames decode to the same requests"
+    );
+}
+
+/// A find with every newer field set, and times with milliseconds.
+fn filtered_find() -> Find {
+    Find {
+        query: String::new(),
+        phrases: vec!["drop off".to_owned(), "the \"north\" gate".to_owned()],
+        filters: Filters {
+            sources: vec![Source::Codex, Source::T3Code],
+            origins: vec!["origin-a".to_owned(), "origin-b".to_owned()],
+            project: Some("Garden".to_owned()),
+            since: Some(Timestamp(1_772_323_200_000)),
+            until: Some(Timestamp(1_772_409_599_999)),
+        },
+        limit: 3,
+    }
+}
+
+fn header_of(frame: &[u8]) -> serde_json::Value {
+    let header_len = u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize;
+    serde_json::from_slice(&frame[4..4 + header_len]).expect("the header is JSON")
+}
+
+#[test]
+fn a_find_without_filters_or_phrases_keeps_the_header_an_older_hub_reads() {
+    let plain = Request::Ask(Ask::Find(Find {
+        query: "json flag".to_owned(),
+        limit: 10,
+        ..Find::default()
+    }));
+    assert_eq!(
+        header_of(&encode_request(&plain)),
+        json!({"type": "find", "query": "json flag", "limit": 10}),
+        "an unused filter or phrase adds nothing to the header"
+    );
+    assert_eq!(
+        decode_requests(&raw_frame(
+            br#"{"type":"find","query":"json flag","limit":10}"#,
+            b""
+        )),
+        [plain],
+        "an older client's header is a find with no filters or phrases"
+    );
+
+    let filtered = Request::Ask(Ask::Find(filtered_find()));
+    assert_eq!(
+        header_of(&encode_request(&filtered)),
+        json!({
+            "type": "find",
+            "query": "",
+            "limit": 3,
+            "phrases": ["drop off", "the \"north\" gate"],
+            "sources": ["codex", "t3-code"],
+            "origins": ["origin-a", "origin-b"],
+            "project": "Garden",
+            "since_ms": 1_772_323_200_000_i64,
+            "until_ms": 1_772_409_599_999_i64,
+        }),
+        "times travel as milliseconds, so the last millisecond of a day survives"
     );
 }
 

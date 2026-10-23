@@ -5,7 +5,7 @@ use std::time::SystemTime;
 
 use prime_radiant::collect::{ImportSummary, import_claude_code, import_t3_code};
 use prime_radiant::index::{Indexer, SyncSummary, Timestamp};
-use prime_radiant::query::Query;
+use prime_radiant::query::{Find, Query};
 use prime_radiant::raw::{Progress, Store, View};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
@@ -297,7 +297,12 @@ fn a_thread_id_resolves_to_its_session() {
     t3.sync();
     let query = Query::open(&t3.data, NOW).expect("query opens");
     for (thread, key) in [(THREAD_A, KEY_A), (THREAD_B, KEY_B)] {
-        let hits = query.find(thread, 10).expect("find runs");
+        let find = Find {
+            query: thread.to_owned(),
+            limit: 10,
+            ..Find::default()
+        };
+        let hits = query.find(&find).expect("find runs");
         let keys: Vec<&str> = hits.iter().map(|hit| hit.key.as_str()).collect();
         assert_eq!(keys, [key], "{thread} resolves through its alias");
     }

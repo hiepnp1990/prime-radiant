@@ -265,6 +265,38 @@ impl Timestamp {
             ((days * 24 + hour) * 60 + minute) * 60_000 + second * 1000 + millis,
         ))
     }
+
+    /// Parses an RFC 3339 time, such as `2026-01-15T10:00:00Z` or `2026-01-15t12:00:00.5+02:00`.
+    pub fn parse_rfc3339(text: &str) -> Option<Self> {
+        let text = text.to_ascii_uppercase();
+        let (local, offset_minutes) = match text.strip_suffix('Z') {
+            Some(local) => (local, 0),
+            None => {
+                let split = text.len().checked_sub(6)?;
+                let (local, offset) = (text.get(..split)?, text.get(split..)?);
+                let sign = match offset.as_bytes()[0] {
+                    b'+' => 1,
+                    b'-' => -1,
+                    _ => return None,
+                };
+                let (hours, minutes) = offset[1..].split_once(':')?;
+                let number = |part: &str, max: i64| {
+                    (part.len() == 2 && part.bytes().all(|b| b.is_ascii_digit()))
+                        .then(|| part.parse::<i64>().ok())
+                        .flatten()
+                        .filter(|n| *n <= max)
+                };
+                (
+                    local,
+                    sign * (number(hours, 23)? * 60 + number(minutes, 59)?),
+                )
+            }
+        };
+        let at = Self::parse_utc(&format!("{local}Z"))?;
+        // `parse_utc` takes a day past the end of the month, such as February 30, which the round trip rejects.
+        (at.to_string().get(..19) == local.get(..19))
+            .then_some(Self(at.0 - offset_minutes * 60_000))
+    }
 }
 
 impl serde::Serialize for Timestamp {

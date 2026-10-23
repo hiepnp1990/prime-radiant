@@ -3,7 +3,7 @@ use std::path::Path;
 
 use prime_radiant::collect::import_claude_code;
 use prime_radiant::index::{Indexer, Timestamp};
-use prime_radiant::query::Query;
+use prime_radiant::query::{Find, Query};
 use prime_radiant::raw::Store;
 use serde_json::json;
 use tempfile::TempDir;
@@ -53,7 +53,11 @@ fn find(root: &Path, words: &str) -> Vec<String> {
         .expect("sync runs");
     Query::open(&data, Timestamp(0))
         .expect("query opens")
-        .find(words, 10)
+        .find(&Find {
+            query: words.to_owned(),
+            limit: 10,
+            ..Find::default()
+        })
         .expect("find runs")
         .into_iter()
         .map(|hit| hit.key)

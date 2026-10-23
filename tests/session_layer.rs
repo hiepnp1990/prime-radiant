@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use base64::Engine as _;
 use prime_radiant::collect::import_claude_code;
 use prime_radiant::index::{Indexer, SyncSummary, Timestamp};
-use prime_radiant::query::Query;
+use prime_radiant::query::{Find, Query};
 use prime_radiant::raw::{RawRef, Sha256, Store, StreamId, View};
 use rusqlite::Connection;
 use serde_json::Value;
@@ -750,7 +750,11 @@ fn write_fork(setup: &Setup, rewrite: bool) -> PathBuf {
 fn find_keys(setup: &Setup, words: &str) -> Vec<String> {
     Query::open(&setup.data, Timestamp(0))
         .expect("query opens")
-        .find(words, 10)
+        .find(&Find {
+            query: words.to_owned(),
+            limit: 10,
+            ..Find::default()
+        })
         .expect("find runs")
         .into_iter()
         .map(|hit| hit.key)

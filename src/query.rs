@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::index::{self, Timestamp};
-use crate::raw::{Progress, View};
+use crate::raw::{Progress, Source, View};
 use crate::redact;
 use crate::transcript::{Matches, Page, Transcript};
 use crate::{Error, Result};
@@ -181,10 +181,58 @@ pub struct SessionStats {
     pub message_count: u64,
 }
 
+/// A `find` question. Every session it returns passes the filters and holds every phrase.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Find {
+    /// Words about the topic, or a session key, an alias, or an ID prefix.
+    pub query: String,
+    /// Text that one message or the title of each session holds, with its words adjacent and in order.
+    pub phrases: Vec<String>,
+    pub filters: Filters,
+    pub limit: usize,
+}
+
+/// What a session's metadata must match for `find` to return it. An empty list or `None` matches every session.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Filters {
+    /// Any of these sources.
+    pub sources: Vec<Source>,
+    /// Any of these origins, the machines or accounts the sessions ran on.
+    pub origins: Vec<String>,
+    /// Text that the project path contains, ignoring case.
+    pub project: Option<String>,
+    /// The earliest last activity.
+    pub since: Option<Timestamp>,
+    /// The latest last activity.
+    pub until: Option<Timestamp>,
+}
+
+impl Filters {
+    fn admits(
+        &self,
+        source: &str,
+        origin: &str,
+        project: Option<&str>,
+        last_activity: Option<Timestamp>,
+    ) -> bool {
+        (self.sources.is_empty() || self.sources.iter().any(|s| s.as_str() == source))
+            && (self.origins.is_empty() || self.origins.iter().any(|o| o == origin))
+            && self.project.as_ref().is_none_or(|part| {
+                project.is_some_and(|p| p.to_lowercase().contains(&part.to_lowercase()))
+            })
+            && self
+                .since
+                .is_none_or(|since| last_activity.is_some_and(|at| at >= since))
+            && self
+                .until
+                .is_none_or(|until| last_activity.is_some_and(|at| at <= until))
+    }
+}
+
 /// A question that a local data folder and the hub answer the same way.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ask {
-    Find { query: String, limit: usize },
+    Find(Find),
     Brief { session: String },
     Stats,
     Read { session: String, page: usize },
@@ -224,7 +272,7 @@ impl Query {
 
     pub fn answer(&self, ask: Ask) -> Result<Answer> {
         Ok(match ask {
-            Ask::Find { query, limit } => Answer::Found(self.find(&query, limit)?),
+            Ask::Find(find) => Answer::Found(self.find(&find)?),
             Ask::Brief { session } => Answer::Brief(Box::new(self.brief(&session)?)),
             Ask::Stats => Answer::Stats(self.stats()?),
             Ask::Read { session, page } => Answer::Page(self.read(&session, page)?),
@@ -247,16 +295,63 @@ impl Query {
         Transcript::render(&self.db, &View::open(&self.dir)?, &key)
     }
 
-    /// An exact key or alias wins, then a unique ID prefix, then full-text search.
-    pub fn find(&self, query: &str, limit: usize) -> Result<Vec<Hit>> {
-        let keys = self.resolve(query)?;
+    /// An exact key or alias wins, then a unique ID prefix, then full-text search. An ID that names only sessions
+    /// outside the filters or without the phrases finds nothing.
+    pub fn find(&self, find: &Find) -> Result<Vec<Hit>> {
+        let admitted = self.admitted(find)?;
+        let keys = self.resolve(&find.query)?;
         if keys.is_empty() {
-            return self.search(query, limit);
+            return self.search(find, &admitted);
         }
         keys.iter()
-            .take(limit)
+            .filter(|key| admitted.contains(*key))
+            .take(find.limit)
             .map(|key| self.hit(key, None, None))
             .collect()
+    }
+
+    /// The sessions that pass the filters and hold every phrase. A subagent's text counts for its main session too.
+    fn admitted(&self, find: &Find) -> Result<HashSet<String>> {
+        let mut holding = self.db.prepare(
+            "SELECT key, IIF(kind = 'subagent', parent_key, NULL) FROM sessions
+             WHERE key IN (SELECT session_key FROM message_search WHERE message_search MATCH ?1
+                           UNION SELECT key FROM title_search WHERE title_search MATCH ?1)",
+        )?;
+        let mut holders = Vec::with_capacity(find.phrases.len());
+        for text in &find.phrases {
+            let mut held = HashSet::new();
+            for row in holding.query_map([phrase(text)], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })? {
+                let (key, main) = row?;
+                held.extend(main);
+                held.insert(key);
+            }
+            holders.push(held);
+        }
+        let mut sessions = self
+            .db
+            .prepare("SELECT key, source, ran_on, project, last_activity FROM sessions")?;
+        let mut admitted = HashSet::new();
+        for row in sessions.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<i64>>(4)?.map(Timestamp),
+            ))
+        })? {
+            let (key, source, origin, project, last_activity) = row?;
+            if find
+                .filters
+                .admits(&source, &origin, project.as_deref(), last_activity)
+                && holders.iter().all(|held| held.contains(&key))
+            {
+                admitted.insert(key);
+            }
+        }
+        Ok(admitted)
     }
 
     pub fn brief(&self, session: &str) -> Result<Brief> {
@@ -362,9 +457,16 @@ impl Query {
             .collect())
     }
 
-    fn search(&self, query: &str, limit: usize) -> Result<Vec<Hit>> {
-        let terms = terms(query);
-        if terms.is_empty() || limit == 0 {
+    /// Ranks the admitted sessions by the query's words and phrases.
+    fn search(&self, find: &Find, admitted: &HashSet<String>) -> Result<Vec<Hit>> {
+        let mut terms: Vec<String> = terms(&find.query).iter().map(|t| phrase(t)).collect();
+        for text in &find.phrases {
+            let text = phrase(&text.to_lowercase());
+            if !terms.contains(&text) {
+                terms.push(text);
+            }
+        }
+        if terms.is_empty() || find.limit == 0 {
             return Ok(Vec::new());
         }
         let main_of = self.main_sessions()?;
@@ -388,9 +490,8 @@ impl Query {
             "SELECT key, -bm25(title_search) FROM title_search WHERE title_search MATCH ?1",
         )?;
         for (i, term) in terms.iter().enumerate() {
-            let phrase = phrase(term);
             let mut matched: HashSet<String> = HashSet::new();
-            let rows = messages.query_map([&phrase], |row| {
+            let rows = messages.query_map([term], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get(2)?))
             })?;
             for row in rows {
@@ -407,7 +508,7 @@ impl Query {
                 matched.insert(session);
             }
             let rows = titles
-                .query_map([&phrase], |row| Ok((row.get::<_, String>(0)?, row.get(1)?)))?
+                .query_map([term], |row| Ok((row.get::<_, String>(0)?, row.get(1)?)))?
                 .collect::<rusqlite::Result<Vec<(String, f64)>>>()?;
             for (session, score) in rows {
                 if !main_of.contains_key(&session) {
@@ -453,7 +554,8 @@ impl Query {
                 .then_with(|| last_activity.get(&b.0).cmp(&last_activity.get(&a.0)))
                 .then_with(|| a.0.cmp(&b.0))
         });
-        ranked.truncate(limit);
+        ranked.retain(|(session, _)| admitted.contains(session));
+        ranked.truncate(find.limit);
 
         let mut best_message: HashMap<&str, (i64, f64)> = HashMap::new();
         for (rowid, (session, score)) in &message_scores {
@@ -462,11 +564,7 @@ impl Query {
                 *best = (*rowid, *score);
             }
         }
-        let any_term = terms
-            .iter()
-            .map(|t| phrase(t))
-            .collect::<Vec<_>>()
-            .join(" OR ");
+        let any_term = terms.join(" OR ");
         ranked
             .iter()
             .map(|(session, score)| {

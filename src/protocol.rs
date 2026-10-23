@@ -9,7 +9,8 @@ use std::io::{self, Read};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::query::{Answer, Ask};
+use crate::index::Timestamp;
+use crate::query::{Answer, Ask, Filters, Find};
 use crate::raw::{Applied, Sha256, Source, StreamKey, StreamState, Write};
 use crate::{Error, Result};
 
@@ -99,9 +100,24 @@ enum Header {
         source: Source,
     },
     Write(WriteHeader),
+    /// The fields after `limit` are newer, and each is left out when empty. A header without them is a find with no
+    /// filters or phrases. An older hub ignores them and answers as if they were empty.
     Find {
         query: String,
         limit: usize,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        phrases: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sources: Vec<Source>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        origins: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+        /// Milliseconds since the Unix epoch, since a timestamp's text form drops the milliseconds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since_ms: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until_ms: Option<i64>,
     },
     Brief {
         session: String,
@@ -231,7 +247,27 @@ pub fn read_request(input: &mut impl Read) -> io::Result<Option<Request>> {
             role,
         },
         Header::State { origin, source } => Request::State { origin, source },
-        Header::Find { query, limit } => Request::Ask(Ask::Find { query, limit }),
+        Header::Find {
+            query,
+            limit,
+            phrases,
+            sources,
+            origins,
+            project,
+            since_ms,
+            until_ms,
+        } => Request::Ask(Ask::Find(Find {
+            query,
+            phrases,
+            filters: Filters {
+                sources,
+                origins,
+                project,
+                since: since_ms.map(Timestamp),
+                until: until_ms.map(Timestamp),
+            },
+            limit,
+        })),
         Header::Brief { session } => Request::Ask(Ask::Brief { session }),
         Header::Stats => Request::Ask(Ask::Stats),
         Header::Read { session, page } => Request::Ask(Ask::Read { session, page }),
@@ -242,7 +278,28 @@ pub fn read_request(input: &mut impl Read) -> io::Result<Option<Request>> {
 
 fn ask_header(ask: Ask) -> Header {
     match ask {
-        Ask::Find { query, limit } => Header::Find { query, limit },
+        Ask::Find(Find {
+            query,
+            phrases,
+            filters:
+                Filters {
+                    sources,
+                    origins,
+                    project,
+                    since,
+                    until,
+                },
+            limit,
+        }) => Header::Find {
+            query,
+            limit,
+            phrases,
+            sources,
+            origins,
+            project,
+            since_ms: since.map(|at| at.0),
+            until_ms: until.map(|at| at.0),
+        },
         Ask::Brief { session } => Header::Brief { session },
         Ask::Stats => Header::Stats,
         Ask::Read { session, page } => Header::Read { session, page },

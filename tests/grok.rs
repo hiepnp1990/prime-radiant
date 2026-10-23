@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use prime_radiant::collect::{self, import_grok};
 use prime_radiant::index::{Indexer, SyncSummary, Timestamp};
-use prime_radiant::query::Query;
+use prime_radiant::query::{Find, Query};
 use prime_radiant::raw::{Store, WriteMode};
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -116,7 +116,11 @@ impl Setup {
     fn find(&self, query: &str) -> Vec<String> {
         Query::open(&self.data, Timestamp(T0_MS))
             .expect("query opens")
-            .find(query, 5)
+            .find(&Find {
+                query: query.to_owned(),
+                limit: 5,
+                ..Find::default()
+            })
             .expect("find runs")
             .into_iter()
             .map(|hit| hit.key)

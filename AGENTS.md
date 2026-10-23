@@ -12,3 +12,7 @@ Anyone can read everything in this repository: files, commit messages, commit au
 - Merge a pull request by fast-forwarding `main` to a single commit that uses the noreply address. If the branch has more than one commit, squash it locally first. Don't merge with GitHub's merge buttons or with `gh pr merge`. Both write the account's primary email into the merge commit, and GitHub rejects the noreply address as the merge author.
 
 A leak that reaches a pull request can't be removed by rewriting history. GitHub keeps the commits of every pull request even after a force-push.
+
+## Verifying changes
+
+Before you claim a change to collection, indexing, search, the hub, or the CLI works, drive it with `.claude/skills/verify-prime-radiant/` (read its `SKILL.md`). It builds this checkout, runs a disposable hub on copies of `tests/fixtures/`, and keeps the evidence of each command. Its search-quality eval runs on a user's own sessions only with their go-ahead, and its outputs never go into the repository.

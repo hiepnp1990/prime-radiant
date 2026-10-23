@@ -18,9 +18,9 @@ use crate::{Error, Result};
 
 const TITLE_CHARS: usize = 80;
 
-/// What one source's parser knows: which session a stream feeds, and what its bytes mean.
+/// What one source's parser knows: which session a stream feeds, or which sessions its lines name, and what its bytes mean.
 pub trait Parser {
-    /// The session a stream belongs to, or `None` for a stream the parser does not read.
+    /// The session a stream belongs to, or `None` for a stream that feeds no one session.
     /// `first_line` is the first complete line of an append stream, without its newline.
     fn session(&self, locator: &str, first_line: Option<&[u8]>) -> Option<Identity>;
     /// One complete line of a stream of `session`, without its newline.
@@ -29,6 +29,11 @@ pub trait Parser {
     fn version(&self, session: &Identity, bytes: &[u8], cuts: Cuts) -> Version;
     /// Another stream that repeats this stream's messages and is read instead whenever the raw layer has it.
     fn superseded_by(&self, _locator: &str) -> Option<String> {
+        None
+    }
+    /// The session that one complete line names and what the line says of it, for an append stream whose lines
+    /// each name a session instead of all feeding one, such as an index of thread names.
+    fn named(&self, _locator: &str, _line: &[u8]) -> Option<(Identity, Facts)> {
         None
     }
 }
@@ -107,7 +112,7 @@ pub struct Facts {
     pub started: Option<Timestamp>,
     /// The title to use while the session has no `title`.
     pub fallback_title: Option<String>,
-    /// Replaces the identity's lineage, but only in the batch of lines that creates the session.
+    /// Replaces the session's lineage, which a new session otherwise takes from its identity.
     pub lineage: Option<Lineage>,
 }
 
@@ -613,9 +618,10 @@ impl Indexer {
         if complete == 0 && !restart {
             return Ok(None);
         }
+        let end = start + complete as u64;
         let first_line = self.first_line(stream, confirmed_offset)?;
         let Some(identity) = parser.session(&stream.key.locator, Some(&first_line)) else {
-            return Ok(None);
+            return self.sync_named(parser, stream, &bytes[..complete], end);
         };
 
         let (facts, lines) = read_lines(parser, &identity, &bytes[..complete], Cuts::INDEX);
@@ -647,18 +653,35 @@ impl Indexer {
             )?;
         }
         let added = index_lines(&tx, stream.key.source, &key, &facts, &messages, touched)?;
-        tx.execute(
-            "INSERT INTO progress (stream, generation, indexed_offset) VALUES (?1, ?2, ?3)
-             ON CONFLICT (stream) DO UPDATE SET generation = excluded.generation,
-                indexed_offset = excluded.indexed_offset, indexed_checksum = NULL",
-            params![
-                stream.id.0,
-                generation as i64,
-                (start + complete as u64) as i64
-            ],
-        )?;
+        append_progress(&tx, stream, end)?;
         tx.commit()?;
         Ok(Some(added))
+    }
+
+    /// Indexes the complete `lines` of an append stream that feeds no one session, up to `end`, for the sessions they
+    /// name. A session named before any of its own streams arrive is created, so that it keeps the name.
+    fn sync_named(
+        &mut self,
+        parser: &dyn Parser,
+        stream: &Stream,
+        lines: &[u8],
+        end: u64,
+    ) -> Result<Option<usize>> {
+        let named: Vec<(Identity, Facts)> = lines
+            .split(|b| *b == b'\n')
+            .filter_map(|line| parser.named(&stream.key.locator, line))
+            .collect();
+        if named.is_empty() {
+            return Ok(None);
+        }
+        let tx = self.db.transaction()?;
+        for (identity, facts) in &named {
+            let key = ensure_session(&tx, stream, identity, facts)?;
+            apply_facts(&tx, &key, facts)?;
+        }
+        append_progress(&tx, stream, end)?;
+        tx.commit()?;
+        Ok(Some(0))
     }
 
     fn sync_replace(
@@ -928,7 +951,8 @@ fn ensure_session(
     };
     tx.execute(
         "INSERT INTO sessions (key, source, native_id, ran_on, kind, parent_key, project)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT (key) DO NOTHING",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT (key) DO UPDATE SET kind = excluded.kind, parent_key = excluded.parent_key WHERE ?8",
         params![
             key.as_str(),
             source.as_str(),
@@ -937,6 +961,7 @@ fn ensure_session(
             kind,
             parent.as_ref().map(SessionKey::as_str),
             identity.project,
+            facts.lineage.is_some(),
         ],
     )?;
     for alias in &identity.aliases {
@@ -946,6 +971,17 @@ fn ensure_session(
         )?;
     }
     Ok(key)
+}
+
+/// Records that the current generation of an append stream is indexed up to `end`.
+fn append_progress(tx: &Transaction, stream: &Stream, end: u64) -> Result<()> {
+    tx.execute(
+        "INSERT INTO progress (stream, generation, indexed_offset) VALUES (?1, ?2, ?3)
+         ON CONFLICT (stream) DO UPDATE SET generation = excluded.generation,
+            indexed_offset = excluded.indexed_offset, indexed_checksum = NULL",
+        params![stream.id.0, stream.state.generation as i64, end as i64],
+    )?;
+    Ok(())
 }
 
 /// Records `facts` on the session. Returns whether this moved the session's start, which can change who owns its messages.

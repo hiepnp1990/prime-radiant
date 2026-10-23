@@ -11,6 +11,8 @@ use super::{
 use crate::redact;
 
 const THREAD_ID_LEN: usize = 36;
+/// Codex's index of thread names, one line for each name it gives a thread.
+const SESSION_INDEX: &str = "session_index.jsonl";
 /// The IDE extensions put the open files first and the typed request after this heading.
 const IDE_REQUEST: &str = "## My request";
 const AGENTS_MD: &str = "# AGENTS.md instructions";
@@ -29,19 +31,7 @@ impl Parser for Codex {
             .strip_suffix(".jsonl.zst")
             .or_else(|| name.strip_suffix(".jsonl"))?;
         let stem = stem.split('_').next()?;
-        let thread = stem.get(stem.len().checked_sub(THREAD_ID_LEN)?..)?;
-        if !thread.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
-            return None;
-        }
-        Some(Identity {
-            native_id: thread.to_owned(),
-            lineage: Lineage::Main,
-            project: None,
-            aliases: vec![Alias {
-                kind: AliasKind::NativeId,
-                value: thread.to_owned(),
-            }],
-        })
+        thread(stem.get(stem.len().checked_sub(THREAD_ID_LEN)?..)?)
     }
 
     fn line(&self, session: &Identity, line: &[u8], cuts: Cuts) -> Line {
@@ -93,6 +83,35 @@ impl Parser for Codex {
             ..Version::default()
         }
     }
+
+    /// Codex appends a line to its session index each time it names a thread, so a thread's last line holds its name.
+    fn named(&self, locator: &str, line: &[u8]) -> Option<(Identity, Facts)> {
+        if locator != SESSION_INDEX {
+            return None;
+        }
+        let entry: IndexEntry = serde_json::from_slice(line).ok()?;
+        let facts = Facts {
+            title: Some(heading(&entry.thread_name)?),
+            ..Facts::default()
+        };
+        Some((thread(&entry.id)?, facts))
+    }
+}
+
+/// The session of the thread with ID `id`, or `None` when `id` is not a thread ID. Its `session_meta` can make it a subagent.
+fn thread(id: &str) -> Option<Identity> {
+    if id.len() != THREAD_ID_LEN || !id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
+        return None;
+    }
+    Some(Identity {
+        native_id: id.to_owned(),
+        lineage: Lineage::Main,
+        project: None,
+        aliases: vec![Alias {
+            kind: AliasKind::NativeId,
+            value: id.to_owned(),
+        }],
+    })
 }
 
 /// Decompresses `bytes` as far as they decode, so a truncated `.zst` still yields its leading lines.
@@ -104,6 +123,12 @@ fn decoded_prefix(bytes: &[u8]) -> Vec<u8> {
 
 fn payload<T: DeserializeOwned>(payload: Value) -> Option<T> {
     serde_json::from_value(payload).ok()
+}
+
+#[derive(Deserialize)]
+struct IndexEntry {
+    id: String,
+    thread_name: String,
 }
 
 #[derive(Deserialize)]

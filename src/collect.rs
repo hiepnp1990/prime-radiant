@@ -30,7 +30,9 @@ pub struct Layout {
     pub source: Source,
     /// The folders under the root that hold the files. An empty name is the root itself.
     folders: &'static [&'static str],
-    /// How the raw layer keeps the file at a locator, or `None` when it leaves the file out.
+    /// Files directly in the root that the raw layer keeps, outside the folders, and how it keeps each.
+    files: &'static [(&'static str, WriteMode)],
+    /// How the raw layer keeps the file at a locator in the folders, or `None` when it leaves the file out.
     write_mode: fn(&str) -> Option<WriteMode>,
 }
 
@@ -51,6 +53,11 @@ impl Layout {
         for folder in self.folders(root) {
             self.visit(root, &folder, &mut files)?;
         }
+        files.extend(
+            self.files
+                .iter()
+                .filter_map(|(name, _)| self.classify(root, &root.join(name))),
+        );
         files.sort_by(|a, b| a.locator.cmp(&b.locator));
         Ok(files)
     }
@@ -120,8 +127,12 @@ impl Layout {
     }
 
     fn local_file(&self, root: &Path, path: &Path) -> Option<LocalFile> {
-        let locator = locator(root, path).filter(|locator| self.within(locator))?;
-        let write_mode = (self.write_mode)(&locator)?;
+        let locator = locator(root, path)?;
+        let write_mode = match self.files.iter().find(|(name, _)| *name == locator) {
+            Some((_, write_mode)) => *write_mode,
+            None if self.within(&locator) => (self.write_mode)(&locator)?,
+            None => return None,
+        };
         Some(LocalFile {
             locator,
             path: path.to_owned(),

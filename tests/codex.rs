@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use prime_radiant::collect::{self, import_codex};
 use prime_radiant::index::{self, Cuts, Indexer, SyncSummary, Timestamp};
+use prime_radiant::query::{Brief, ParentKind, Query};
 use prime_radiant::raw::{RawRef, Sha256, Source, Store, StreamId, View, WriteMode};
 use rusqlite::Connection;
 use serde_json::Value;
@@ -118,6 +119,35 @@ impl Setup {
         )
     }
 
+    /// Appends a line to the session index, as Codex does each time it names a thread.
+    fn name(&self, thread: &str, name: &str, at: &str) {
+        let line = serde_json::json!({"id": thread, "thread_name": name, "updated_at": at});
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.join("session_index.jsonl"))
+            .expect("session index opens for append")
+            .write_all(format!("{line}\n").as_bytes())
+            .expect("name is appended");
+    }
+
+    fn query(&self) -> Query {
+        Query::open(&self.data, Timestamp(0)).expect("query opens")
+    }
+
+    fn brief(&self, key: &str) -> Brief {
+        self.query().brief(key).expect("brief runs")
+    }
+
+    fn find(&self, words: &str) -> Vec<String> {
+        self.query()
+            .find(words, 10)
+            .expect("find runs")
+            .into_iter()
+            .map(|hit| hit.key)
+            .collect()
+    }
+
     fn session(&self, key: &str) -> (String, Option<String>, Option<String>, Option<String>) {
         self.index()
             .query_row(
@@ -182,8 +212,9 @@ fn fixture_zst_is_the_live_rollout_plus_its_last_lines() {
 }
 
 #[test]
-fn scan_keeps_rollouts_only() {
+fn scan_keeps_rollouts_and_the_session_index() {
     let setup = Setup::new();
+    setup.name(SESSION_ID, "Listing output", "2026-01-15T10:30:00.000000Z");
     fs::write(setup.root.join("history.jsonl"), "{}\n").expect("history is written");
     fs::write(setup.root.join(DAY).join(".DS_Store"), "").expect("junk is written");
     fs::write(
@@ -216,6 +247,7 @@ fn scan_keeps_rollouts_only() {
                 format!("archived_sessions/rollout-2026-01-15T10-00-00-{SESSION_ID}.jsonl.zst"),
                 WriteMode::Replace
             ),
+            ("session_index.jsonl".to_owned(), WriteMode::Append),
             (
                 format!("{DAY}/rollout-2026-01-15T10-00-00-{SESSION_ID}.jsonl"),
                 WriteMode::Append
@@ -233,7 +265,88 @@ fn scan_keeps_rollouts_only() {
                 WriteMode::Append
             ),
         ],
-        "live rollouts append, finished rollouts replace, and nothing else is kept"
+        "live rollouts and the session index append, finished rollouts replace, and nothing else is kept"
+    );
+}
+
+#[test]
+fn a_thread_name_titles_its_session_and_a_rename_replaces_it() {
+    let setup = Setup::new();
+    setup.import();
+    setup.sync();
+
+    setup.name(
+        SESSION_ID,
+        "Listing output for automation",
+        "2026-01-15T10:30:00.000000Z",
+    );
+    setup.import();
+    setup.sync();
+    assert_eq!(
+        setup.brief(MAIN_KEY).title.as_deref(),
+        Some("Listing output for automation"),
+        "a name given after the thread started replaces the title from its first request"
+    );
+    assert_eq!(
+        setup.find("automation"),
+        [MAIN_KEY],
+        "a word only in the name finds the thread"
+    );
+
+    setup.name(
+        SESSION_ID,
+        "Readable listing",
+        "2026-01-15T11:00:00.000000Z",
+    );
+    setup.import();
+    setup.sync();
+    assert_eq!(
+        setup.brief(MAIN_KEY).title.as_deref(),
+        Some("Readable listing"),
+        "the latest name wins"
+    );
+    assert_eq!(
+        setup.find("readable"),
+        [MAIN_KEY],
+        "the new name finds the thread"
+    );
+    assert!(
+        setup.find("automation").is_empty(),
+        "the old name no longer does"
+    );
+    assert_eq!(
+        setup.brief(SUBAGENT_KEY).title.as_deref(),
+        Some("Review the --json change in src/cli.rs for missing escapes"),
+        "another thread keeps its title"
+    );
+}
+
+#[test]
+fn a_name_that_arrives_before_its_thread_titles_it_and_keeps_its_parent() {
+    let setup = Setup::new();
+    let rollout = fs::read(setup.subagent()).expect("subagent rollout is readable");
+    fs::remove_file(setup.subagent()).expect("subagent rollout is removed");
+    setup.name(
+        SUBAGENT_ID,
+        "Escaping review",
+        "2026-01-15T10:01:00.500000Z",
+    );
+    setup.import();
+    setup.sync();
+
+    fs::write(setup.subagent(), rollout).expect("subagent rollout is written");
+    setup.import();
+    setup.sync();
+    let brief = setup.brief(SUBAGENT_KEY);
+    assert_eq!(
+        brief.title.as_deref(),
+        Some("Escaping review"),
+        "the name outlasts the rollout's first request"
+    );
+    assert_eq!(
+        brief.parent.map(|parent| (parent.key, parent.kind)),
+        Some((MAIN_KEY.to_owned(), ParentKind::Subagent)),
+        "the rollout still makes the thread a subagent of its session"
     );
 }
 

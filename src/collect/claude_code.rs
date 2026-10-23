@@ -5,6 +5,7 @@ use crate::raw::{Source, WriteMode};
 pub const LAYOUT: Layout = Layout {
     source: Source::ClaudeCode,
     folders: &[""],
+    files: &[],
     write_mode,
 };
 

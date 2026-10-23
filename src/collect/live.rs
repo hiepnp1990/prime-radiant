@@ -139,8 +139,8 @@ impl Input {
         }
     }
 
-    /// What the watcher covers: each folder that holds the files, and the root, so that a folder created later is
-    /// seen. Codex and Grok keep much else under their roots.
+    /// What the watcher covers: each folder that holds the files, and the root, so that a folder created later and a
+    /// file kept in the root are seen. Codex and Grok keep much else under their roots.
     fn watches(&self) -> Vec<(PathBuf, RecursiveMode)> {
         match self {
             Input::Files { layout, root } => {

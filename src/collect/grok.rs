@@ -15,6 +15,7 @@ const SESSION_FILES: [(&str, WriteMode); 5] = [
 pub const LAYOUT: Layout = Layout {
     source: Source::Grok,
     folders: &["sessions"],
+    files: &[],
     write_mode,
 };
 

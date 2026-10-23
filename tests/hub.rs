@@ -1383,6 +1383,15 @@ fn collector_watches_every_source_and_sends_each_change() {
         archive.join(format!("rollout-2026-01-15T10-00-00-{CODEX_ID}.jsonl.zst")),
     )
     .expect("a finished rollout is archived");
+    // Codex writes its session index in its home folder the first time it names a thread.
+    fs::write(
+        codex.join("session_index.jsonl"),
+        format!(
+            "{}\n",
+            json!({"id": CODEX_ID, "thread_name": "Scriptable listing", "updated_at": "2026-01-15T10:30:00.000000Z"})
+        ),
+    )
+    .expect("the session index is written");
     append(
         &grok.join(GROK_FOLDER).join(GROK_ID).join("updates.jsonl"),
         &made_up("grok-append"),
@@ -1413,6 +1422,7 @@ fn collector_watches_every_source_and_sends_each_change() {
     for (id, key) in [
         (SESSION_ID.to_owned(), MAIN_KEY.to_owned()),
         (CODEX_ID.to_owned(), format!("codex/{CODEX_ID}")),
+        ("scriptable".to_owned(), format!("codex/{CODEX_ID}")),
         (GROK_ID.to_owned(), format!("grok/{GROK_ID}")),
         (THREADS[0].to_owned(), format!("t3-code/{}", THREADS[0])),
     ] {

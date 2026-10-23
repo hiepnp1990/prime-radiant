@@ -287,8 +287,10 @@ enum HubCommand {
     },
     /// Copy stdin to the hub's socket and the socket to stdout, for a collector that runs it over SSH.
     Connect {
+        /// The data folder the hub serves. Defaults to ~/.local/share/prime-radiant, the folder `service install hub`
+        /// serves.
         #[arg(long)]
-        data: PathBuf,
+        data: Option<PathBuf>,
     },
 }
 
@@ -302,7 +304,7 @@ struct Target {
     /// The hub's socket on this machine, <data>/hub.sock.
     #[arg(long)]
     hub_socket: Option<PathBuf>,
-    /// A command whose stdin and stdout reach the hub, such as "ssh <host> prime-radiant hub connect --data <dir>".
+    /// A command whose stdin and stdout reach the hub, such as "ssh <hub-host> .local/bin/prime-radiant hub connect".
     #[arg(long)]
     hub_command: Option<String>,
 }
@@ -368,7 +370,7 @@ struct HubArgs {
     /// The hub's socket on this machine, <data>/hub.sock.
     #[arg(long)]
     hub_socket: Option<PathBuf>,
-    /// A command whose stdin and stdout reach the hub, such as "ssh <host> prime-radiant hub connect --data <dir>".
+    /// A command whose stdin and stdout reach the hub, such as "ssh <hub-host> .local/bin/prime-radiant hub connect".
     #[arg(long)]
     hub_command: Option<String>,
 }
@@ -537,7 +539,7 @@ enum ConfigCommand {
 enum Setting {
     /// A command whose stdin and stdout reach the hub, given as one quoted argument.
     HubCommand {
-        /// Such as "ssh <host> prime-radiant hub connect --data <dir>". It runs with `sh -c`, which expands ~ and $HOME.
+        /// Such as "ssh <hub-host> .local/bin/prime-radiant hub connect". It runs with `sh -c`, which expands ~ and $HOME.
         command: String,
     },
     /// The hub's socket on this machine, <data>/hub.sock.
@@ -807,7 +809,19 @@ fn run(command: Command) -> prime_radiant::Result<()> {
         } => hub::serve(&data),
         Command::Hub {
             command: HubCommand::Connect { data },
-        } => Ok(hub::connect(&data)?),
+        } => {
+            let data = match data {
+                Some(data) => data,
+                None => Places::from_env()
+                    .ok_or_else(|| {
+                        prime_radiant::Error::Usage(
+                            "HOME is not an absolute path; give --data".to_owned(),
+                        )
+                    })?
+                    .default_data(),
+            };
+            Ok(hub::connect(&data)?)
+        }
         Command::Collect {
             origin,
             sources,
@@ -1090,16 +1104,26 @@ fn collector_text(state: &Snapshot, running: bool, now: Timestamp) -> String {
                 progress::count(progress.files_done),
                 progress::count(progress.files_total)
             );
+            let indent = "    ";
             out += &wrap(
                 &match &progress.current {
-                    Some(current) => format!(
-                        "sending {}, {} · {files}",
-                        current.locator,
-                        progress::size_of(current.bytes_done, current.bytes_total)
-                    ),
+                    Some(current) => {
+                        let done = format!(
+                            "{} · {files}",
+                            progress::size_of(current.bytes_done, current.bytes_total)
+                        );
+                        let line = format!("sending {}, {done}", current.locator);
+                        if indent.len() + line.chars().count() <= WIDTH {
+                            line
+                        } else {
+                            // The file gets a line of its own, so that wrapping never splits its name.
+                            let room = WIDTH - indent.len() - "sending ,".len();
+                            format!("sending {},\n{done}", shorten(&current.locator, room))
+                        }
+                    }
                     None => files,
                 },
-                "    ",
+                indent,
             );
         }
         Phase::Live { first_sync, .. } => {
@@ -1422,6 +1446,24 @@ fn relative<'a>(path: &'a str, project: Option<&str>) -> &'a str {
 
 fn optional_time(at: Option<Timestamp>) -> String {
     at.map_or("unknown".to_owned(), |at| at.to_string())
+}
+
+/// `text` in at most `room` characters. A longer one loses its middle, marked `…`, and keeps its start and its file
+/// name, or its start and its end when the file name alone fills the room.
+fn shorten(text: &str, room: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= room {
+        return text.to_owned();
+    }
+    let keep = room.saturating_sub(1);
+    let name = match chars.iter().rposition(|&c| c == '/') {
+        Some(slash) => chars.len() - slash,
+        None => chars.len(),
+    };
+    let tail = if name < keep { name } else { keep / 2 };
+    let head: String = chars[..keep - tail].iter().collect();
+    let end: String = chars[chars.len() - tail..].iter().collect();
+    format!("{head}…{end}")
 }
 
 /// Wraps text at word boundaries to the width, prefixing each line with `indent`.

@@ -68,7 +68,7 @@ pub fn serve(dir: &Path) -> Result<()> {
 }
 
 /// Copies stdin to the hub's socket and the socket to stdout, so a collector on another machine can reach the hub
-/// through `ssh <host> prime-radiant hub connect --data <dir>`. Returns when the hub closes the connection.
+/// through `ssh <hub-host> .local/bin/prime-radiant hub connect`. Returns when the hub closes the connection.
 pub fn connect(dir: &Path) -> io::Result<()> {
     let path = socket_path(dir);
     let mut socket = UnixStream::connect(&path).map_err(|error| at(&path, error))?;

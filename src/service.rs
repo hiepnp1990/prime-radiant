@@ -11,9 +11,12 @@ mod systemd;
 use std::fmt;
 use std::fs;
 use std::io;
+use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::client::HubAddress;
 use crate::raw::Source;
@@ -523,6 +526,11 @@ pub fn install(request: Install) -> Result<()> {
         Some(binary) => binary,
         None => std::env::current_exe()?,
     };
+    // `service install collector` with no hub flag finds the hub by this socket, so install waits until it answers.
+    let socket = match &request.spec {
+        Spec::Hub { data } => Some(crate::hub::socket_path(&absolute(data, &user.home)?)),
+        Spec::Collector { .. } => None,
+    };
     let service = Service::new(request.spec, &program, request.memory_max, &user.home)?;
     if !service.program.is_file() {
         return Err(Error::Usage(format!(
@@ -533,7 +541,37 @@ pub fn install(request: Install) -> Result<()> {
     let replacing = manager.definition(&service.kind, &user).exists();
     let mut plan = manager.install(&service, &user, replacing);
     plan.warnings.extend(manager.logout_warning(&user));
-    plan.carry_out(request.dry_run)
+    plan.carry_out(request.dry_run)?;
+    if let Some(socket) = socket
+        && !request.dry_run
+    {
+        if answers(&socket, HUB_START) {
+            println!("the hub answers on {}", socket.display());
+        } else {
+            eprintln!(
+                "warning: the hub does not answer on {} after {} s; read its log, {}",
+                socket.display(),
+                HUB_START.as_secs(),
+                manager.log(&Kind::Hub, &user)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// How long `service install hub` waits for the hub it started to answer.
+const HUB_START: Duration = Duration::from_secs(10);
+
+/// Whether a process accepts a connection on `socket` within `wait`.
+fn answers(socket: &Path, wait: Duration) -> bool {
+    let deadline = Instant::now() + wait;
+    while UnixStream::connect(socket).is_err() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    true
 }
 
 /// Stops the service and removes its definition. Its data and log stay. A dry run prints the plan and changes nothing.
@@ -584,4 +622,22 @@ pub fn list() -> Result<()> {
         println!("  log: {}", service.log);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn a_socket_answers_once_something_listens_on_it() {
+        let dir = tempfile::Builder::new()
+            .prefix("pr")
+            .tempdir_in("/tmp")
+            .expect("temp directory is created");
+        let socket = dir.path().join("hub.sock");
+        assert!(!answers(&socket, Duration::from_millis(100)));
+        let _listener = UnixListener::bind(&socket).expect("the socket listens");
+        assert!(answers(&socket, Duration::ZERO));
+    }
 }

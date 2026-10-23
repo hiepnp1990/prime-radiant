@@ -269,8 +269,8 @@ fn refuses_unsupported_platforms() {
             "names the platform: {message}"
         );
         assert!(
-            message.contains("cargo install --git"),
-            "points to the source install: {message}"
+            message.contains("cargo install --git") && message.contains("--root ~/.local"),
+            "points to the source install, into the folder this script uses: {message}"
         );
         assert!(
             !sandbox.default_bin().exists(),

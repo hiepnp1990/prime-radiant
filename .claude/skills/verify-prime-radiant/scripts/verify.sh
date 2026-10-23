@@ -13,7 +13,11 @@ verify.sh home RUN LABEL ARGS...       like cli, with HOME and the XDG folders i
                                        and PRIME_RADIANT_HUB unset, so no real config, skill, or state is touched
 verify.sh collector RUN start|stop|crash  run a collector over the fixture copies; crash is SIGKILL
                                        (its state file is RUN/state/collect-verify.json)
+verify.sh collector RUN home           run a collector in RUN/home, as home runs a call, with no source or
+                                       hub flag, so it finds the harnesses and the hub there
 verify.sh hub RUN stop|start           stop the hub this run started, or start it again on the same data
+verify.sh stand-in-ssh RUN             write RUN/tools/ssh, which stands in for ssh to the hub's machine;
+                                       put RUN/tools first on PATH
 verify.sh big-session RUN MIB          add a made-up transcript of about MIB mebibytes to the Claude Code copy
 verify.sh append RUN TEXT              append a user line with TEXT to the fixture transcript copy
 verify.sh token                        print a fresh one-word token, such as quokka3f9a1c2e
@@ -126,11 +130,18 @@ cli() {
   return $status
 }
 
+# Sets IN_HOME to the command prefix that runs a call with HOME and the XDG folders in RUN/home and
+# PRIME_RADIANT_HUB unset.
+home_env() {
+  mkdir -p "$RUN/home"
+  IN_HOME=(env -u PRIME_RADIANT_HUB HOME="$RUN/home" XDG_CONFIG_HOME="$RUN/home/.config"
+    XDG_STATE_HOME="$RUN/home/.local/state" XDG_DATA_HOME="$RUN/home/.local/share")
+}
+
 home() {
   load "$1"
-  mkdir -p "$RUN/home"
-  env -u PRIME_RADIANT_HUB HOME="$RUN/home" XDG_CONFIG_HOME="$RUN/home/.config" \
-    XDG_STATE_HOME="$RUN/home/.local/state" XDG_DATA_HOME="$RUN/home/.local/share" bash "$0" cli "$@"
+  home_env
+  "${IN_HOME[@]}" bash "$0" cli "$@"
 }
 
 collector() {
@@ -142,6 +153,14 @@ collector() {
         --state-file "$RUN/state/collect-verify.json" >>"$RUN/collector.log" 2>&1 &
       echo $! >"$RUN/collector.pid"
       ;;
+    home)
+      # The state file is where collect would put it anyway. Naming it puts RUN on the command line, which cleanup
+      # checks before it stops the process.
+      home_env
+      "${IN_HOME[@]}" nohup "$BIN" collect --origin verify --sweep-seconds 5 \
+        --state-file "$RUN/home/.local/state/prime-radiant/collect-verify.json" >>"$RUN/collector.log" 2>&1 &
+      echo $! >"$RUN/collector.pid"
+      ;;
     stop | crash)
       if alive "$RUN/collector.pid"; then
         kill "$([ "$2" = crash ] && echo -9 || echo -TERM)" "$(cat "$RUN/collector.pid")"
@@ -150,6 +169,21 @@ collector() {
       ;;
     *) usage; exit 2 ;;
   esac
+}
+
+# `-G` prints connection sharing as on. A remote command runs in HOME with a PATH that lacks prime-radiant, as a
+# non-interactive SSH shell on the hub's machine may.
+stand_in_ssh() {
+  load "$1"
+  mkdir -p "$RUN/tools"
+  cat >"$RUN/tools/ssh" <<'EOF'
+#!/bin/sh
+for arg in "$@"; do [ "$arg" = -G ] && exec printf 'controlmaster auto\ncontrolpath /tmp/control-%%C\n'; done
+shift
+cd "$HOME" && PATH=/usr/bin:/bin exec sh -c "$*"
+EOF
+  chmod +x "$RUN/tools/ssh"
+  echo "wrote $RUN/tools/ssh"
 }
 
 append() {
@@ -234,6 +268,7 @@ case ${1:-} in
   home) shift; home "$@" ;;
   collector) collector "$2" "$3" ;;
   hub) hub "$2" "$3" ;;
+  stand-in-ssh) stand_in_ssh "$2" ;;
   big-session) big_session "$2" "$3" ;;
   append) append "$2" "$3" ;;
   wait-find) wait_find "$2" "$3" "${4:-30}" ;;

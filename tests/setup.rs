@@ -797,7 +797,7 @@ fn doctor_fails_with_the_next_step_when_no_hub_is_set() {
         .unwrap_or_else(|| panic!("{out}"));
     let next = out[at..].lines().nth(1).expect("a failure has a next step");
     assert!(
-        next.starts_with("      next: save the hub with `prime-radiant config set hub-command \"ssh <hub-host> prime-radiant hub connect --data <dir>\"`"),
+        next.starts_with("      next: save the hub with `prime-radiant config set hub-command \"ssh <hub-host> .local/bin/prime-radiant hub connect\"`"),
         "{next}"
     );
     assert_eq!(stderr, "error: 1 check failed\n");
@@ -868,6 +868,71 @@ fn doctor_warns_when_only_the_variable_names_the_hub_and_ssh_shares_no_connectio
         out.contains("ok    SSH connection sharing is on for example-hub\n"),
         "{out}"
     );
+}
+
+#[test]
+fn doctor_names_the_binary_by_path_when_ssh_runs_it_by_name_and_cannot_find_it() {
+    let mut home = Home::new();
+    let tools = home.join("tools");
+    fs::create_dir_all(&tools).expect("the folder is created");
+    let ssh = tools.join("ssh");
+    fs::write(
+        &ssh,
+        "#!/bin/sh\n\
+         # Stands in for ssh: prints ssh-G.txt for -G, and otherwise runs the remote command in the home folder with\n\
+         # a PATH that lacks this build, as a non-interactive SSH shell on the hub's machine may.\n\
+         for arg in \"$@\"; do [ \"$arg\" = -G ] && exec cat \"$(dirname \"$0\")/ssh-G.txt\"; done\n\
+         shift\n\
+         cd \"$HOME\" && PATH=/usr/bin:/bin exec sh -c \"$*\"\n",
+    )
+    .expect("the stand-in is written");
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).expect("the stand-in runs");
+    fs::write(
+        tools.join("ssh-G.txt"),
+        "hostname example-hub\ncontrolmaster auto\ncontrolpath /tmp/control-%C\n",
+    )
+    .expect("settings are written");
+    home.path_first.push(tools);
+    let _hub = Hub::start(&home, home.join(".local/share/prime-radiant"), true);
+    fs::create_dir_all(home.join(".local/bin")).expect("the folder is created");
+    std::os::unix::fs::symlink(BIN, home.join(".local/bin/prime-radiant"))
+        .expect("the binary is installed");
+
+    home.ok(&[
+        "config",
+        "set",
+        "hub-command",
+        "ssh example-hub prime-radiant hub connect",
+    ]);
+    let (out, _) = home.fails(&["doctor"]);
+    let at = out
+        .find("fail  cannot reach the hub: ")
+        .unwrap_or_else(|| panic!("the hub is out of reach:\n{out}"));
+    let lines: Vec<&str> = out[at..].lines().skip(1).take(3).collect();
+    assert_eq!(
+        lines,
+        [
+            "      next: run `ssh example-hub prime-radiant hub connect </dev/null` to see its error",
+            "warn  the hub command runs prime-radiant by name on example-hub, and the non-interactive shell that SSH \
+             runs it in may not have ~/.local/bin on PATH",
+            "      next: if it printed that prime-radiant was not found, name the binary by its path: prime-radiant \
+             config set hub-command 'ssh example-hub .local/bin/prime-radiant hub connect'",
+        ],
+        "{out}"
+    );
+
+    home.ok(&[
+        "config",
+        "set",
+        "hub-command",
+        "ssh example-hub .local/bin/prime-radiant hub connect",
+    ]);
+    let out = home.ok(&["doctor"]);
+    assert!(
+        out.contains("ok    the hub answered in ") && out.contains(" streams from 1 origin\n"),
+        "hub connect with no --data reaches the hub that serves ~/.local/share/prime-radiant:\n{out}"
+    );
+    assert!(!out.contains("by name"), "{out}");
 }
 
 #[test]

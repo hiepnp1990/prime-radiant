@@ -21,7 +21,7 @@ platform="$(uname -s) $(uname -m)"
 case $platform in
 "Linux x86_64") asset=prime-radiant-linux-x86_64 ;;
 "Darwin arm64") asset=prime-radiant-macos-arm64 ;;
-*) die "no prebuilt binary for $platform. Build from source instead: cargo install --git https://github.com/$repo --locked" ;;
+*) die "no prebuilt binary for $platform. Build from source instead: cargo install --git https://github.com/$repo --locked --root ${PREFIX:-~/.local}" ;;
 esac
 
 command -v curl >/dev/null 2>&1 || die "curl is required"

@@ -1891,6 +1891,78 @@ fn status_reports_what_the_hub_holds_from_each_origin_and_its_last_write() {
 }
 
 #[test]
+fn status_shortens_a_long_file_name_so_that_every_line_fits_in_100_columns() {
+    let setup = Setup::new();
+    let long = "-Users-dev-build-a-project-whose-folder-name-keeps-going-for-quite-a-while/\
+                33831ab7-5c2a-48a4-a8d7-0b5125040f4d/subagents/agent-a75ce3543dd257a2d.jsonl";
+    let usual = format!("-home-dev-example-project/{SESSION_ID}.jsonl");
+    let short = format!("threads/{}.json", THREADS[0]);
+    let huge_name = format!("-home-dev-example-project/{}.jsonl", "x".repeat(120));
+    fs::create_dir_all(setup.state_dir()).expect("the state folder is created");
+    for (origin, locator) in [
+        ("a", long),
+        ("b", usual.as_str()),
+        ("c", short.as_str()),
+        ("d", huge_name.as_str()),
+    ] {
+        let at = "2026-03-01T09:00:00Z";
+        let state = json!({
+            "origin": origin, "pid": 1, "started_at": at, "updated_at": at,
+            "phase": {"name": "first_sync", "connected_since": at, "progress": {
+                "started_at": at, "files_total": 10, "files_done": 3,
+                "bytes_total": 1 << 20, "bytes_done": 1 << 19, "rate": null,
+                "current": {"locator": locator, "bytes_total": 2048, "bytes_done": 1024},
+            }},
+            "sent_bytes": 1 << 19, "last_sent": null, "errors": 0, "last_error": null,
+        });
+        fs::write(
+            setup.state_dir().join(format!("collect-{origin}.json")),
+            state.to_string(),
+        )
+        .expect("the state file is written");
+    }
+
+    let text = setup.status(&[]);
+    for line in text.lines() {
+        assert!(
+            line.chars().count() <= 100,
+            "{line:?} fits in 100 columns:\n{text}"
+        );
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.starts_with("    sending -Users-dev-build-a-project-"))
+        .unwrap_or_else(|| panic!("the long file name keeps its start:\n{text}"));
+    assert!(
+        lines[at].ends_with("…/agent-a75ce3543dd257a2d.jsonl,"),
+        "the long file name keeps its file name on one line:\n{text}"
+    );
+    let done = "    1.0 of 2.0 KiB · 3 of 10 files done";
+    assert_eq!(lines[at + 1], done);
+    let at = lines
+        .iter()
+        .position(|line| *line == format!("    sending {usual},"))
+        .unwrap_or_else(|| panic!("a file name that fits stays whole:\n{text}"));
+    assert_eq!(lines[at + 1], done);
+    assert!(
+        lines.contains(
+            &format!("    sending {short}, 1.0 of 2.0 KiB · 3 of 10 files done").as_str()
+        ),
+        "a line that fits stays one line:\n{text}"
+    );
+    let at = lines
+        .iter()
+        .position(|line| line.starts_with("    sending -home-dev-example-project/xxx"))
+        .unwrap_or_else(|| panic!("a file name too long for the line keeps its start:\n{text}"));
+    assert!(
+        lines[at].ends_with("xxx.jsonl,") && lines[at].contains('…'),
+        "and its end:\n{text}"
+    );
+    assert_eq!(lines[at + 1], done);
+}
+
+#[test]
 fn status_tells_an_older_or_silent_hub_apart_and_does_not_wait_forever() {
     let setup = Setup::new();
     let socket = setup.temp.path().join("older-hub.sock");

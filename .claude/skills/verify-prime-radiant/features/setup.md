@@ -18,7 +18,7 @@ A new user saves the route to the hub once with `prime-radiant config set`, in `
 
 ## How to get to it (user POV)
 
-- Run `prime-radiant config set hub-command "ssh <host> prime-radiant hub connect --data <dir>"` or `prime-radiant config set hub-socket <path>`, then `prime-radiant config show`. Run `prime-radiant config unset hub` to remove it.
+- Run `prime-radiant config set hub-command "ssh <hub-host> .local/bin/prime-radiant hub connect"` or `prime-radiant config set hub-socket <path>`, then `prime-radiant config show`. Run `prime-radiant config unset hub` to remove it.
 - Run `prime-radiant service install collector --origin <name>` or `prime-radiant collect --origin <name>` with no source or hub flag.
 - Run `prime-radiant skill install [--harness claude-code|codex|grok]... [--force] [--dry-run]`, and `prime-radiant skill uninstall` with the same flags.
 - Run `prime-radiant doctor`.

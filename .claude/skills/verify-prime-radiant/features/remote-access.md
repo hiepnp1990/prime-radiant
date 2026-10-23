@@ -1,6 +1,6 @@
 # Remote access
 
-On a machine without the hub, the CLI reaches it through any command whose stdin and stdout connect to `prime-radiant hub connect --data <dir>` on the hub machine, usually over SSH. `prime-radiant config set hub-command` saves that command for every call in every shell, and the `PRIME_RADIANT_HUB` variable sets it for the shells that have it.
+On a machine without the hub, the CLI reaches it through any command whose stdin and stdout connect to `prime-radiant hub connect` on the hub machine, usually over SSH. With no `--data`, `hub connect` reaches the hub that serves `~/.local/share/prime-radiant`. `prime-radiant config set hub-command` saves that command for every call in every shell, and the `PRIME_RADIANT_HUB` variable sets it for the shells that have it.
 
 ## Sub-features
 
@@ -10,8 +10,8 @@ On a machine without the hub, the CLI reaches it through any command whose stdin
 
 ## How to get to it (user POV)
 
-- Run `prime-radiant find <words> --hub-command "ssh <host> prime-radiant hub connect --data <dir>"`.
-- Set `export PRIME_RADIANT_HUB="ssh <host> prime-radiant hub connect --data <dir>"`, then run `prime-radiant find <words>`.
+- Run `prime-radiant find <words> --hub-command "ssh <hub-host> .local/bin/prime-radiant hub connect"`.
+- Set `export PRIME_RADIANT_HUB="ssh <hub-host> .local/bin/prime-radiant hub connect"`, then run `prime-radiant find <words>`.
 
 ## Driving it with verify.sh
 

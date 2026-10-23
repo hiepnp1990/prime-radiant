@@ -35,4 +35,5 @@ Each feature file starts with an H1 and one paragraph on the user-visible behavi
 - [Services](./services.md): `service install`, `uninstall`, and `list` keep the hub and collectors running as login services; a dry run prints the definition and changes nothing.
 - [Progress and status](./progress-and-status.md): the collector reports its phase and first-sync progress, and `status` shows every collector and what the hub holds from each origin.
 - [Setup](./setup.md): `config set` saves the route to the hub in a file every shell reads, `doctor` checks the setup and names the next step, and `skill install` gives each harness the skill.
+- [First install](./first-install.md): the README quickstart from nothing to a `find`, with `hub connect` on the default data folder, the `doctor` warning for a binary SSH runs by name, and `scripts/fresh-install-check.sh`.
 - [Search quality](./search-quality.md): measures topic search on the user's own sessions against ground truth from the harnesses' own files.

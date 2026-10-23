@@ -17,7 +17,7 @@ const CLIENT_ORIGIN: &str = "client";
 pub enum HubAddress {
     /// The hub's socket on this machine.
     Socket(PathBuf),
-    /// A shell command whose stdin and stdout reach the hub, such as `ssh <host> prime-radiant hub connect --data <dir>`.
+    /// A shell command whose stdin and stdout reach the hub, such as `ssh <hub-host> .local/bin/prime-radiant hub connect`.
     Command(String),
 }
 

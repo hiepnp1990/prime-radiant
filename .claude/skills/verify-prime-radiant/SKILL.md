@@ -1,6 +1,6 @@
 ---
 name: verify-prime-radiant
-description: Drive a disposable Prime Radiant instance (CLI, hub, collector) built from this checkout and capture proof that import, find, brief, read, grep, live sync, remote access, collector progress and status, and setup (config, doctor, skill install) work. Also measures search quality on the user's own sessions. Use before claiming a change to collection, indexing, search, the hub, or the CLI works, or when asked to verify Prime Radiant.
+description: Drive a disposable Prime Radiant instance (CLI, hub, collector) built from this checkout and capture proof that import, find, brief, read, grep, live sync, remote access, collector progress and status, setup (config, doctor, skill install), and the README quickstart's first install work. Also measures search quality on the user's own sessions. Use before claiming a change to collection, indexing, search, the hub, or the CLI works, or when asked to verify Prime Radiant.
 ---
 
 # Verify Prime Radiant
@@ -83,5 +83,5 @@ It stops only the hub and collector whose pid files are in `RUN`, and only if th
 
 ## Helpers
 
-- `scripts/verify.sh`: `launch`, `doctor`, `cli`, `home`, `collector start|stop|crash`, `hub stop|start`, `big-session`, `token`, `append`, `wait-find`, `cleanup`. Run `scripts/verify.sh` with no arguments for usage.
+- `scripts/verify.sh`: `launch`, `doctor`, `cli`, `home`, `collector start|home|stop|crash`, `hub stop|start`, `stand-in-ssh`, `big-session`, `token`, `append`, `wait-find`, `cleanup`. Run `scripts/verify.sh` with no arguments for usage.
 - `eval/`: ground truth and scoring for search quality on the user's own sessions. See `features/search-quality.md`.

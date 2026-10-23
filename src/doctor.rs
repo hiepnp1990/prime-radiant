@@ -69,7 +69,12 @@ pub fn run(report: &mut dyn FnMut(Check)) {
                 &route,
                 config::read(&places).ok().as_ref(),
             ));
-            out.all([reach(&route.hub, HUB_TIMEOUT)]);
+            let reached = reach(&route.hub, HUB_TIMEOUT);
+            let unreachable = matches!(reached, Check::Fail { .. });
+            out.all([reached]);
+            if unreachable {
+                out.all(by_name_over_ssh(&route.hub));
+            }
             out.all(ssh_sharing(&route.hub));
         }
         Ok(None) => out.all([no_hub(&places)]),
@@ -153,8 +158,8 @@ fn no_hub(places: &Places) -> Check {
             places.config_file.display(),
             places.default_socket().display()
         ),
-        "save the hub with `prime-radiant config set hub-command \"ssh <hub-host> prime-radiant hub connect --data \
-         <dir>\"`, or with `prime-radiant config set hub-socket <dir>/hub.sock` on the hub's machine",
+        "save the hub with `prime-radiant config set hub-command \"ssh <hub-host> .local/bin/prime-radiant hub \
+         connect\"`, or with `prime-radiant config set hub-socket <dir>/hub.sock` on the hub's machine",
     )
 }
 
@@ -235,6 +240,9 @@ fn unreachable_next(hub: &HubAddress) -> String {
                  `prime-radiant hub serve --data {data}`"
             )
         }
+        HubAddress::Command(command) if by_path(command).is_some() => {
+            format!("run `{command} </dev/null` to see its error")
+        }
         HubAddress::Command(command) => format!(
             "run `{command} </dev/null` to see its error. Over SSH, the hub machine's non-interactive shell may not \
              have prime-radiant on PATH, so give its full path in the command"
@@ -242,12 +250,55 @@ fn unreachable_next(hub: &HubAddress) -> String {
     }
 }
 
+/// For an SSH hub command that runs `prime-radiant` by name, a warning with the same command naming the binary by the
+/// path that `install.sh` and the README use.
+fn by_name_over_ssh(hub: &HubAddress) -> Option<Check> {
+    let HubAddress::Command(command) = hub else {
+        return None;
+    };
+    let (host, fixed) = by_path(command)?;
+    Some(warn(
+        format!(
+            "the hub command runs prime-radiant by name on {host}, and the non-interactive shell that SSH runs it in \
+             may not have ~/.local/bin on PATH"
+        ),
+        format!(
+            "if it printed that prime-radiant was not found, name the binary by its path: prime-radiant config set \
+             hub-command {}",
+            shell_word(&fixed)
+        ),
+    ))
+}
+
+/// The host and the command with `.local/bin/` put before the `prime-radiant` that an SSH command runs on the host, or
+/// `None` when the command is not `ssh` or names the binary some other way. The rest of the text stays as the user
+/// wrote it, so that its quotes, `~`, and `$HOME` still expand where they did.
+fn by_path(command: &str) -> Option<(String, String)> {
+    let remote_program = |command: &str| {
+        let (_, host, remote) = ssh_destination(&words(command)?)?;
+        // ssh joins the remote words with spaces, and the shell on the hub's machine splits them again.
+        let program = remote.join(" ").split_whitespace().next()?.to_owned();
+        Some((host, program))
+    };
+    let (host, program) = remote_program(command)?;
+    if program != "prime-radiant" {
+        return None;
+    }
+    command
+        .match_indices("prime-radiant")
+        .map(|(at, _)| format!("{}.local/bin/{}", &command[..at], &command[at..]))
+        .find(|fixed| {
+            remote_program(fixed).is_some_and(|(_, program)| program == ".local/bin/prime-radiant")
+        })
+        .map(|fixed| (host, fixed))
+}
+
 /// For a hub reached over SSH, a hint when SSH connection sharing is off, so that each query opens a new connection.
 fn ssh_sharing(hub: &HubAddress) -> Option<Check> {
     let HubAddress::Command(command) = hub else {
         return None;
     };
-    let (options, host) = ssh_destination(&words(command)?)?;
+    let (options, host, _) = ssh_destination(&words(command)?)?;
     let output = Command::new("ssh")
         .args(&options)
         .arg("-G")
@@ -280,8 +331,9 @@ fn ssh_sharing(hub: &HubAddress) -> Option<Check> {
     })
 }
 
-/// The options before the destination and the destination of an `ssh` command, or `None` for another command.
-fn ssh_destination(words: &[String]) -> Option<(Vec<String>, String)> {
+/// The options before the destination, the destination, and the remote command's words of an `ssh` command, or `None`
+/// for another command.
+fn ssh_destination(words: &[String]) -> Option<(Vec<String>, String, Vec<String>)> {
     // Options of ssh that take a value.
     const VALUED: &str = "BbcDEeFIiJLlmOoPpQRSWw";
     let mut words = words.iter().skip_while(|word| is_assignment(word));
@@ -301,7 +353,7 @@ fn ssh_destination(words: &[String]) -> Option<(Vec<String>, String)> {
                     options.push(words.next()?.clone());
                 }
             }
-            _ => return Some((options, word.clone())),
+            _ => return Some((options, word.clone(), words.cloned().collect())),
         }
     }
     None
@@ -513,8 +565,12 @@ fn skills(detected: &[Detected], home: &Path) -> Vec<Check> {
 mod tests {
     use super::*;
 
-    fn destination(command: &str) -> Option<(Vec<String>, String)> {
+    fn destination(command: &str) -> Option<(Vec<String>, String, Vec<String>)> {
         ssh_destination(&words(command).expect("the quotes close"))
+    }
+
+    fn strings(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| word.to_string()).collect()
     }
 
     #[test]
@@ -524,25 +580,25 @@ mod tests {
                 r#"ssh -o "ProxyCommand=nc %h %p" -p 2222 -A hub-host prime-radiant hub connect"#
             ),
             Some((
-                vec![
-                    "-o".to_owned(),
-                    "ProxyCommand=nc %h %p".to_owned(),
-                    "-p".to_owned(),
-                    "2222".to_owned(),
-                    "-A".to_owned()
-                ],
-                "hub-host".to_owned()
+                strings(&["-o", "ProxyCommand=nc %h %p", "-p", "2222", "-A"]),
+                "hub-host".to_owned(),
+                strings(&["prime-radiant", "hub", "connect"])
             ))
         );
         assert_eq!(
             destination("LC_ALL=C /usr/bin/ssh -Tp22 dev@hub-host 'prime-radiant hub connect'"),
-            Some((vec!["-Tp22".to_owned()], "dev@hub-host".to_owned()))
+            Some((
+                strings(&["-Tp22"]),
+                "dev@hub-host".to_owned(),
+                strings(&["prime-radiant hub connect"])
+            ))
         );
         assert_eq!(
             destination("ssh -Ti ~/.ssh/key hub-host x"),
             Some((
-                vec!["-Ti".to_owned(), "~/.ssh/key".to_owned()],
-                "hub-host".to_owned()
+                strings(&["-Ti", "~/.ssh/key"]),
+                "hub-host".to_owned(),
+                strings(&["x"])
             ))
         );
         assert_eq!(
@@ -550,6 +606,40 @@ mod tests {
             None
         );
         assert_eq!(destination("ssh -o"), None);
+    }
+
+    fn fixed(command: &str) -> Option<String> {
+        by_path(command).map(|(_, fixed)| fixed)
+    }
+
+    #[test]
+    fn the_fix_names_the_binary_by_path_and_keeps_the_rest_of_the_command_as_written() {
+        assert_eq!(
+            fixed("ssh hub-host prime-radiant hub connect").as_deref(),
+            Some("ssh hub-host .local/bin/prime-radiant hub connect")
+        );
+        // The host is named prime-radiant too, and ~ and $HOME stay for the shell that runs the command to expand.
+        assert_eq!(
+            fixed(
+                r#"SSH_AUTH_SOCK=$HOME/agent.sock ssh -i ~/.ssh/key -o "ProxyCommand=nc %h %p" prime-radiant prime-radiant hub connect --data ~/data"#
+            )
+            .as_deref(),
+            Some(
+                r#"SSH_AUTH_SOCK=$HOME/agent.sock ssh -i ~/.ssh/key -o "ProxyCommand=nc %h %p" prime-radiant .local/bin/prime-radiant hub connect --data ~/data"#
+            )
+        );
+        assert_eq!(
+            fixed("ssh hub-host 'prime-radiant hub connect'").as_deref(),
+            Some("ssh hub-host '.local/bin/prime-radiant hub connect'")
+        );
+        for command in [
+            "ssh hub-host /opt/bin/prime-radiant hub connect",
+            "ssh hub-host prime-radiant-hub connect",
+            "ssh hub-host",
+            "prime-radiant hub connect",
+        ] {
+            assert_eq!(fixed(command), None, "{command}");
+        }
     }
 
     #[test]

@@ -14,10 +14,11 @@ Use it when the user refers to a past session: a session ID or ID prefix, a titl
 ## Order
 
 1. `find` the session. Pass an ID, an ID prefix of 8 or more characters, a link, or a few words about the topic.
-2. If one candidate clearly fits, run `brief` on its key. The brief is usually enough to answer.
-3. If several candidates are close, show them to the user (title, project, last activity) and ask which one they mean. Don't guess.
-4. For one detail the brief lacks, such as an error message, a command, or a file name, run `grep` on the session, then `read` only the page it names.
-5. Run `read` page by page only when the user asks for the full transcript. Each page ends with the command for the next page.
+2. `find` matches words literally. If nothing fits, search again up to twice with the words the session itself would likely use: the product, tool, or file names, and the concrete task instead of the user's paraphrase.
+3. If one candidate clearly fits, run `brief` on its key. The brief is usually enough to answer.
+4. If several candidates are close, show them to the user (title, project, last activity) and ask which one they mean. Don't guess.
+5. For one detail the brief lacks, such as an error message, a command, or a file name, run `grep` on the session, then `read` only the page it names.
+6. Run `read` page by page only when the user asks for the full transcript. Each page ends with the command for the next page.
 
 ## Commands
 

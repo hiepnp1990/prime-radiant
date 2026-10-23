@@ -603,6 +603,25 @@ fn write_transcript(root: &Path, project: &str, session: &str, size: usize, topi
     format!("{project}/{session}.jsonl")
 }
 
+/// Appends about `size` bytes of filler lines to the transcript at `path` and returns its new length.
+fn grow_transcript(path: &Path, session: &str, size: usize) -> u64 {
+    let filler = "lorem ipsum dolor sit amet ".repeat(600);
+    let mut text = String::new();
+    let mut i = 0;
+    while text.len() < size {
+        i += 1;
+        let progress =
+            json!({"type": "progress", "sessionId": session, "data": format!("more {i} {filler}")});
+        text += &format!("{progress}\n");
+    }
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("transcript opens for append");
+    file.write_all(text.as_bytes()).expect("filler is appended");
+    file.metadata().expect("transcript has metadata").len()
+}
+
 fn line(session: &str, kind: &str, uuid: &str, parent: Option<&str>, content: Value) -> String {
     let line = json!({
         "parentUuid": parent,
@@ -873,7 +892,7 @@ fn hub_killed_mid_write_restarts_with_nothing_past_the_committed_offsets() {
         LARGE_BYTES,
         "build cache",
     );
-    let len = fs::metadata(root.join(&large))
+    let mut len = fs::metadata(root.join(&large))
         .expect("transcript exists")
         .len();
     let mut hub = setup.hub();
@@ -888,10 +907,11 @@ fn hub_killed_mid_write_restarts_with_nothing_past_the_committed_offsets() {
             thread::sleep(Duration::from_millis(1));
             continue;
         };
-        assert!(
-            offset < len,
-            "the large stream finished before the hub was caught mid-write"
-        );
+        if offset >= len {
+            // A fast machine can write the whole stream between two looks, so give the hub more to write.
+            len = grow_transcript(&root.join(&large), LARGE_ID, LARGE_BYTES);
+            continue;
+        }
         let log = setup
             .data
             .join("streams")

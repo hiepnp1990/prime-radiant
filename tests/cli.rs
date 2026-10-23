@@ -16,6 +16,8 @@ const SUBAGENT_KEY: &str =
     "claude-code/33831ab7-5c2a-48a4-a8d7-0b5125040f4d/agent-a75ce3543dd257a2d";
 const OTHER_ID: &str = "5f0c9e21-7d4b-4c3a-9e8f-2b6a1d0c4e77";
 const OTHER_KEY: &str = "claude-code/5f0c9e21-7d4b-4c3a-9e8f-2b6a1d0c4e77";
+const FORK_ID: &str = "9e7d4c21-3b5a-4f60-8a1e-6c2f0b9d8e14";
+const FORK_KEY: &str = "claude-code/9e7d4c21-3b5a-4f60-8a1e-6c2f0b9d8e14";
 
 struct Setup {
     _temp: TempDir,
@@ -336,6 +338,44 @@ fn brief_extracts_the_session_and_is_rebuilt_after_a_new_line() {
     );
     assert_eq!(rebuilt["pull_requests"], json!([pull_request]));
     assert_eq!(rebuilt["state"], "live", "the session ran a moment ago");
+}
+
+#[test]
+fn brief_names_a_subagent_or_a_fork_and_the_session_it_belongs_to() {
+    let setup = Setup::new();
+    let original = fs::read_to_string(setup.main_transcript()).expect("transcript is readable");
+    let own = line(
+        FORK_ID,
+        "user",
+        "c0000000-0000-4000-8000-000000000003",
+        None,
+        json!("Now add a quiet flag that hides the banner."),
+        "2026-01-16T08:00:05.000Z",
+    );
+    fs::write(
+        setup
+            .main_transcript()
+            .with_file_name(format!("{FORK_ID}.jsonl")),
+        original + &own,
+    )
+    .expect("fork transcript is written");
+    setup.import();
+
+    assert_eq!(setup.brief(MAIN_KEY)["parent"], Value::Null);
+    for (session, kind, label) in [
+        (SUBAGENT_KEY, "subagent", "subagent of"),
+        (FORK_KEY, "fork", "fork of"),
+    ] {
+        assert_eq!(
+            setup.brief(session)["parent"],
+            json!({"key": MAIN_KEY, "kind": kind})
+        );
+        let text = run(&["brief", session, "--data", path(&setup.data)]);
+        assert!(
+            text.contains(&format!("{label}: {MAIN_KEY}")),
+            "the {kind} brief says {label:?}:\n{text}"
+        );
+    }
 }
 
 #[test]

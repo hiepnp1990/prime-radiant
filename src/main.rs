@@ -9,7 +9,7 @@ use prime_radiant::collect::{import_claude_code, import_codex, import_grok, impo
 use prime_radiant::hub;
 use prime_radiant::index::{Indexer, Timestamp};
 use prime_radiant::protocol::Request;
-use prime_radiant::query::{Answer, Ask, Brief, Hit, Query, Stats};
+use prime_radiant::query::{Answer, Ask, Brief, Hit, ParentKind, Query, Stats};
 use prime_radiant::raw::{Source, Store};
 use prime_radiant::transcript::{Matches, Page};
 use serde::Serialize;
@@ -431,7 +431,11 @@ fn brief_text(brief: &Brief) -> String {
     line(brief.title.as_deref().unwrap_or("(untitled)"));
     line(&format!("key: {}", brief.key));
     if let Some(parent) = &brief.parent {
-        line(&format!("subagent of: {parent}"));
+        let relation = match parent.kind {
+            ParentKind::Fork => "fork of",
+            ParentKind::Subagent => "subagent of",
+        };
+        line(&format!("{relation}: {}", parent.key));
     }
     line(&format!(
         "project: {}",

@@ -90,7 +90,7 @@ pub struct Brief {
     pub title: Option<String>,
     pub project: Option<String>,
     pub origin: String,
-    pub parent: Option<String>,
+    pub parent: Option<Parent>,
     pub started: Option<Timestamp>,
     pub last_activity: Option<Timestamp>,
     pub state: State,
@@ -105,6 +105,19 @@ pub struct Brief {
     #[serde(flatten)]
     pub body: BriefBody,
     pub freshness: Freshness,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Parent {
+    pub key: String,
+    pub kind: ParentKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ParentKind {
+    Fork,
+    Subagent,
 }
 
 /// The extracted part of a brief, stored in `briefs` and rebuilt when the session has newer messages.
@@ -250,7 +263,7 @@ impl Query {
         let key = self.one_session(session)?;
         let (title, project, origin, parent, started, last_activity, archived_at, deleted_at) =
             self.db.query_row(
-                "SELECT title, project, ran_on, parent_key, started_at, last_activity, archived_at, deleted_at
+                "SELECT title, project, ran_on, parent_key, started_at, last_activity, archived_at, deleted_at, kind
                  FROM sessions WHERE key = ?1",
                 [&key],
                 |row| {
@@ -258,7 +271,13 @@ impl Query {
                         row.get::<_, Option<String>>(0)?,
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(3)?
+                            .zip(match row.get::<_, String>(8)?.as_str() {
+                                "fork" => Some(ParentKind::Fork),
+                                "subagent" => Some(ParentKind::Subagent),
+                                _ => None,
+                            })
+                            .map(|(key, kind)| Parent { key, kind }),
                         row.get::<_, Option<i64>>(4)?.map(Timestamp),
                         row.get::<_, Option<i64>>(5)?.map(Timestamp),
                         row.get::<_, Option<i64>>(6)?.map(Timestamp),

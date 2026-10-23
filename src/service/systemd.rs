@@ -34,7 +34,7 @@ pub(super) fn kind(file_name: &str) -> Option<Kind> {
 pub(super) fn render(service: &Service) -> String {
     let mut out = String::from(HEADER);
     out += "[Unit]\n";
-    out += &format!("Description=Prime Radiant {}\n", service.kind.describe());
+    out += &format!("Description=Prime Radiant {}\n", service.kind);
     if let Kind::Collector(_) = service.kind {
         // Ordering only. Without a hub unit on this machine the line does nothing, and a collector retries a hub that is down.
         out += &format!("After={}\n", unit(&Kind::Hub));

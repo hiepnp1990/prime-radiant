@@ -61,11 +61,13 @@ impl Kind {
             Kind::Collector(origin) => format!("collect-{origin}"),
         }
     }
+}
 
-    fn describe(&self) -> String {
+impl fmt::Display for Kind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Kind::Hub => "hub".to_owned(),
-            Kind::Collector(origin) => format!("collector for {origin}"),
+            Kind::Hub => f.write_str("hub"),
+            Kind::Collector(origin) => write!(f, "collector for {origin}"),
         }
     }
 }
@@ -472,17 +474,18 @@ impl Step {
     }
 }
 
-fn write_replacing(path: &Path, contents: &str) -> io::Result<()> {
-    let folder = path.parent().expect("a definition is inside a folder");
+/// Writes `contents` to `path` through a temporary file in the same folder, so a reader sees the old file or the new.
+pub(crate) fn write_replacing(path: &Path, contents: &str) -> io::Result<()> {
+    let folder = path.parent().expect("the file is inside a folder");
     fs::create_dir_all(folder)?;
-    let name = path.file_name().expect("a definition has a file name");
+    let name = path.file_name().expect("the file has a name");
     let temporary = folder.join(format!(".{}.tmp", name.to_string_lossy()));
     fs::write(&temporary, contents)?;
     fs::rename(&temporary, path)
 }
 
 /// `text` as one shell word.
-fn shell_word(text: &str) -> String {
+pub(crate) fn shell_word(text: &str) -> String {
     let plain = !text.is_empty()
         && text
             .chars()
@@ -538,27 +541,47 @@ pub fn uninstall(kind: Kind, dry_run: bool) -> Result<()> {
     let manager = Manager::current()?;
     let user = User::current()?;
     if !manager.definition(&kind, &user).exists() {
-        println!("no {} is installed as a service", kind.describe());
+        println!("no {kind} is installed as a service");
         return Ok(());
     }
     manager.uninstall(&kind, &user).carry_out(dry_run)
 }
 
-/// Prints each Prime Radiant service of this user, whether it is running, and where its log is.
-pub fn list() -> Result<()> {
+/// A Prime Radiant service of this user, as its manager reports it.
+pub struct Installed {
+    pub kind: Kind,
+    /// Such as `running`, `stopped`, or `not loaded`.
+    pub state: String,
+    pub definition: PathBuf,
+    pub log: String,
+}
+
+/// Every Prime Radiant service of this user, the hub first.
+pub fn installed() -> Result<Vec<Installed>> {
     let manager = Manager::current()?;
     let user = User::current()?;
-    let kinds = manager.installed(&user)?;
-    if kinds.is_empty() {
+    Ok(manager
+        .installed(&user)?
+        .into_iter()
+        .map(|kind| Installed {
+            state: manager.status(&kind, &user),
+            definition: manager.definition(&kind, &user),
+            log: manager.log(&kind, &user),
+            kind,
+        })
+        .collect())
+}
+
+/// Prints each Prime Radiant service of this user, whether it is running, and where its log is.
+pub fn list() -> Result<()> {
+    let services = installed()?;
+    if services.is_empty() {
         println!("no Prime Radiant services are installed");
     }
-    for kind in kinds {
-        println!("{}: {}", kind.describe(), manager.status(&kind, &user));
-        println!(
-            "  definition: {}",
-            manager.definition(&kind, &user).display()
-        );
-        println!("  log: {}", manager.log(&kind, &user));
+    for service in services {
+        println!("{}: {}", service.kind, service.state);
+        println!("  definition: {}", service.definition.display());
+        println!("  log: {}", service.log);
     }
     Ok(())
 }

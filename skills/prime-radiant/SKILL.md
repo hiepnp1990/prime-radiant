@@ -44,7 +44,9 @@ prime-radiant read <session> [--page N]
 
 ## Reaching the hub
 
-With no flag, the CLI runs the hub command in `PRIME_RADIANT_HUB`, such as `ssh <hub-host> prime-radiant hub connect --data <dir>`. To choose another way, pass `--hub-command "<command>"`, `--hub-socket <path>` for a hub on this machine, or `--data <dir>` for a local data folder. If no flag is given and the variable is unset, the CLI says so. Tell the user instead of guessing a hub.
+With no flag, the CLI reaches the hub that `prime-radiant config show` prints. It takes `PRIME_RADIANT_HUB` first, then the config file that `prime-radiant config set` writes, then a hub that serves `~/.local/share/prime-radiant` on this machine. To reach another hub, pass `--hub-command "<command>"`, `--hub-socket <path>` for a hub on this machine, or `--data <dir>` for a local data folder.
+
+If a command says no hub is set or can't reach the hub, run `prime-radiant doctor` and tell the user what it reports, with its next steps. Don't guess a hub, and don't search local files instead, because the session may exist only on the hub. Ask the user before you run `prime-radiant config set`, because it changes the hub for every shell.
 
 ## Secrets
 

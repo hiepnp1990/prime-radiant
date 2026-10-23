@@ -16,7 +16,7 @@
 - Run `prime-radiant find <id, prefix, link, or words> [--limit N] [--json]`.
 - Add `--source <harness>`, `--origin <machine>`, `--project <text>`, `--since <YYYY-MM-DD>`, `--until <YYYY-MM-DD>`, or `--phrase "<words>"` to any `find`.
 - Run `prime-radiant brief <key, alias, or prefix> [--json]`.
-- Each works with `--data <dir>`, `--hub-socket <sock>`, `--hub-command <cmd>`, or `PRIME_RADIANT_HUB`.
+- Each works with `--data <dir>`, `--hub-socket <sock>`, `--hub-command <cmd>`, or no flag for the route `config show` prints.
 
 ## Driving it with verify.sh
 

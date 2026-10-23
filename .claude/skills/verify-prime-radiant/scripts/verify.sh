@@ -8,7 +8,9 @@ usage() {
 verify.sh launch                       build, copy fixtures, start a hub; prints RUN=<dir>
 verify.sh doctor RUN                   check the instance is ours, current, and answering
 verify.sh cli RUN LABEL ARGS...        run prime-radiant ARGS, record it as evidence
-                                       (@RUN@, @SOCK@, @DATA@, @SESSIONS@, @BIN@ in ARGS are replaced)
+                                       (@RUN@, @SOCK@, @DATA@, @SESSIONS@, @BIN@, @HOME@ in ARGS are replaced)
+verify.sh home RUN LABEL ARGS...       like cli, with HOME and the XDG folders in RUN/home (@HOME@)
+                                       and PRIME_RADIANT_HUB unset, so no real config, skill, or state is touched
 verify.sh collector RUN start|stop|crash  run a collector over the fixture copies; crash is SIGKILL
                                        (its state file is RUN/state/collect-verify.json)
 verify.sh hub RUN stop|start           stop the hub this run started, or start it again on the same data
@@ -105,6 +107,7 @@ cli() {
     arg=${arg//@RUN@/$RUN}
     arg=${arg//@DATA@/$DATA}
     arg=${arg//@SESSIONS@/$SESSIONS}
+    arg=${arg//@HOME@/$RUN/home}
     args+=("${arg//@BIN@/$BIN}")
   done
   n=$(find "$EVIDENCE" -maxdepth 1 -name '[0-9][0-9]-*.txt' | wc -l | tr -d ' ')
@@ -121,6 +124,13 @@ cli() {
   cat "$file.err" >&2
   rm -f "$file.out" "$file.err"
   return $status
+}
+
+home() {
+  load "$1"
+  mkdir -p "$RUN/home"
+  env -u PRIME_RADIANT_HUB HOME="$RUN/home" XDG_CONFIG_HOME="$RUN/home/.config" \
+    XDG_STATE_HOME="$RUN/home/.local/state" XDG_DATA_HOME="$RUN/home/.local/share" bash "$0" cli "$@"
 }
 
 collector() {
@@ -221,6 +231,7 @@ case ${1:-} in
   launch) launch ;;
   doctor) doctor "$2" ;;
   cli) shift; cli "$@" ;;
+  home) shift; home "$@" ;;
   collector) collector "$2" "$3" ;;
   hub) hub "$2" "$3" ;;
   big-session) big_session "$2" "$3" ;;

@@ -38,6 +38,39 @@ curl -fsSL https://raw.githubusercontent.com/hiepnp1990/prime-radiant/main/insta
 
 On other platforms, build from source.
 
+## Set up
+
+The hub runs on an always-on machine, such as a home server or a VPS. Each machine that runs coding agents also runs a collector, which sends that machine's sessions to the hub.
+
+On the hub's machine, run the hub and a collector as login services:
+
+```sh
+prime-radiant service install hub
+prime-radiant service install collector --origin <name>
+```
+
+The hub serves `~/.local/share/prime-radiant`, and the CLI on the same machine finds it there with no other setup.
+
+On each other machine, save the route to the hub once, then install a collector:
+
+```sh
+prime-radiant config set hub-command "ssh <hub-host> prime-radiant hub connect --data <hub data folder>"
+prime-radiant service install collector --origin <name>
+```
+
+`config set` writes `~/.config/prime-radiant/config.toml`, which every shell reads. A `PRIME_RADIANT_HUB` exported in `~/.bashrc` reaches only interactive shells, and an agent's tool shell often isn't one. Over SSH, the hub's machine runs the command in a non-interactive shell too, so give the full path to `prime-radiant` if that shell doesn't have it on its `PATH`.
+
+With no source flag, `collect` and `service install collector` read every harness the machine has: Claude Code, Codex, Grok, and T3 Code. With no hub flag, they reach the hub that `prime-radiant config show` prints.
+
+Then give each harness's agents the skill, and check the setup:
+
+```sh
+prime-radiant skill install
+prime-radiant doctor
+```
+
+`skill install` writes the skill to `~/.claude/skills`, `~/.codex/skills`, and `~/.grok/skills`, for each of those harnesses the machine has. It replaces only a copy it wrote, and never one that is a link to another folder. `doctor` changes nothing. It prints `ok`, `warn`, or `fail` for each check, and the next step after each warning and failure.
+
 ## Design decisions
 
 - [0001. Central session store on an always-on hub](docs/decisions/0001-central-session-store.md)

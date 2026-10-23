@@ -1,5 +1,8 @@
 pub mod client;
 pub mod collect;
+pub mod config;
+pub mod doctor;
+pub mod harness;
 pub mod hub;
 pub mod index;
 pub mod protocol;
@@ -7,6 +10,7 @@ pub mod query;
 pub mod raw;
 pub mod redact;
 pub mod service;
+pub mod skill;
 pub mod transcript;
 
 use std::fmt;

@@ -10,6 +10,7 @@ use serde_json::Value;
 use crate::{Error, Result};
 
 const THREADS: &str = "SELECT * FROM orchestration_v2_projection_threads ORDER BY thread_id";
+const THREAD_COUNT: &str = "SELECT count(*) FROM orchestration_v2_projection_threads";
 const PROJECTS: &str = "SELECT * FROM projection_projects";
 const MESSAGES: &str = "SELECT * FROM orchestration_v2_projection_messages
     ORDER BY thread_id, created_at, message_id";
@@ -64,6 +65,12 @@ pub fn snapshots(db_path: &Path) -> Result<Vec<ThreadSnapshot>> {
             })
         })
         .collect()
+}
+
+/// How many threads a T3 Code database holds, read without changing it.
+pub fn thread_count(db_path: &Path) -> Result<u64> {
+    let count: i64 = open_read_only(db_path)?.query_row(THREAD_COUNT, [], |row| row.get(0))?;
+    Ok(count.unsigned_abs())
 }
 
 fn open_read_only(path: &Path) -> Result<Connection> {

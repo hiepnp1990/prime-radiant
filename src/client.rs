@@ -1,22 +1,33 @@
 //! Reaching the hub: a collector keeps one connection open, and a query command asks one question and hangs up.
 
+use std::fmt;
 use std::io::{self, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
-use crate::protocol::{self, Request, Response, Role};
+use crate::protocol::{self, OriginStats, Request, Response, Role};
 use crate::{Error, Result};
 
 /// The origin a query client names in its hello. A client writes nothing, so its origin is never stored.
 const CLIENT_ORIGIN: &str = "client";
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HubAddress {
     /// The hub's socket on this machine.
     Socket(PathBuf),
     /// A shell command whose stdin and stdout reach the hub, such as `ssh <host> prime-radiant hub connect --data <dir>`.
     Command(String),
+}
+
+impl fmt::Display for HubAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HubAddress::Socket(path) => write!(f, "the hub socket {}", path.display()),
+            HubAddress::Command(command) => write!(f, "the hub command {command}"),
+        }
+    }
 }
 
 /// Both directions of a connection to the hub, and what to close when it ends.
@@ -101,5 +112,46 @@ pub fn ask(hub: &HubAddress, request: Request) -> Result<Response> {
     match answer {
         Response::Error { message } => Err(Error::Usage(message)),
         answer => Ok(answer),
+    }
+}
+
+/// Why the hub named no origins.
+#[derive(Debug)]
+pub enum NoOrigins {
+    /// The hub could not decode the question, so it is older than this client.
+    Older(String),
+    /// The hub, or the command in between, answered with an error.
+    Refused(String),
+    Unreachable(io::Error),
+    Other(String),
+}
+
+impl fmt::Display for NoOrigins {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NoOrigins::Older(message) => write!(
+                f,
+                "the hub does not know this question, so it is older than this client: {message}"
+            ),
+            NoOrigins::Refused(message) => write!(f, "the hub could not answer: {message}"),
+            NoOrigins::Unreachable(error) => write!(f, "cannot reach the hub: {error}"),
+            NoOrigins::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+/// Asks the hub how much it holds from each origin.
+pub fn origins(hub: &HubAddress) -> std::result::Result<Vec<OriginStats>, NoOrigins> {
+    match ask(hub, Request::Origins) {
+        Ok(Response::Origins { origins }) => Ok(origins),
+        Ok(other) => Err(NoOrigins::Other(format!("the hub answered {other:?}"))),
+        // A hub answers "bad frame" to a request it cannot decode, which this client sends only to a hub older than
+        // the question.
+        Err(Error::Usage(message)) if message.starts_with("bad frame") => {
+            Err(NoOrigins::Older(message))
+        }
+        Err(Error::Usage(message)) => Err(NoOrigins::Refused(message)),
+        Err(Error::Io(error)) => Err(NoOrigins::Unreachable(error)),
+        Err(error) => Err(NoOrigins::Other(error.to_string())),
     }
 }

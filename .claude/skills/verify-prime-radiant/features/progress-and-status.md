@@ -15,7 +15,7 @@ A collector says what it is doing at any time. It keeps a state file, `collect-<
 ## How to get to it (user POV)
 
 - Run `prime-radiant collect --origin <name> --hub-socket <sock> --claude-code <folder> ...`, with `--state-file <path>` to keep the state elsewhere. Watch its stderr in a terminal or in the service's log.
-- Run `prime-radiant status` with `--hub-socket <sock>`, `--hub-command <command>`, `--data <dir>` (the hub serving that folder), or `PRIME_RADIANT_HUB`. Add `--json` for one object, `--watch` to redraw until Ctrl-C, and `--state-dir <dir>` when the state files are elsewhere.
+- Run `prime-radiant status` with `--hub-socket <sock>`, `--hub-command <command>`, `--data <dir>` (the hub serving that folder), or no flag for the route `config show` prints. Add `--json` for one object, `--watch` to redraw until Ctrl-C, and `--state-dir <dir>` when the state files are elsewhere.
 
 ## Driving it with verify.sh
 
@@ -32,7 +32,7 @@ Preconditions:
 - **Hub down.** Run `scripts/verify.sh hub "$RUN" stop`, wait 3 s, then run `scripts/verify.sh cli "$RUN" status-hub-down status --state-dir @RUN@/state --hub-socket @SOCK@`. It shows `reconnecting in N s (hub unreachable)` or `reconnecting now (hub unreachable)`, `no connection to the hub for X`, and `hub: unavailable: cannot reach the hub: ...`.
 - **Hub back.** Run `scripts/verify.sh hub "$RUN" start`, wait 10 s, then run `scripts/verify.sh cli "$RUN" status-hub-back status --state-dir @RUN@/state --hub-socket @SOCK@`. The collector is `live` again with `first sync: the hub lacked nothing`, and the hub part reads `verify: 20 streams, Y, no write since the hub started`.
 - **Stopped.** Run `scripts/verify.sh collector "$RUN" crash`, then `scripts/verify.sh cli "$RUN" status-stopped status --state-dir @RUN@/state --hub-command "@BIN@ hub connect --data @DATA@"`. It shows `verify: stopped, last seen X ago` with X at most about 10 s, then `when last seen: live · ...`. The hub part still answers, through the bridge.
-- **No hub.** Run `env -u PRIME_RADIANT_HUB scripts/verify.sh cli "$RUN" status-no-hub status --state-dir @RUN@/state`. It exits 0, shows the stopped collector, and ends with `hub: unavailable: no hub to ask: give --data, --hub-socket, or --hub-command, or set PRIME_RADIANT_HUB ...`.
+- **No hub.** Run `scripts/verify.sh home "$RUN" status-no-hub status --state-dir @RUN@/state`. It exits 0, shows the stopped collector, and ends with `hub: unavailable: no hub to ask: no hub is set: ...`.
 
 ## Gotchas
 

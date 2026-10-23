@@ -1,11 +1,11 @@
 ---
 name: verify-prime-radiant
-description: Drive a disposable Prime Radiant instance (CLI, hub, collector) built from this checkout and capture proof that import, find, brief, read, grep, live sync, remote access, and collector progress and status work. Also measures search quality on the user's own sessions. Use before claiming a change to collection, indexing, search, the hub, or the CLI works, or when asked to verify Prime Radiant.
+description: Drive a disposable Prime Radiant instance (CLI, hub, collector) built from this checkout and capture proof that import, find, brief, read, grep, live sync, remote access, collector progress and status, and setup (config, doctor, skill install) work. Also measures search quality on the user's own sessions. Use before claiming a change to collection, indexing, search, the hub, or the CLI works, or when asked to verify Prime Radiant.
 ---
 
 # Verify Prime Radiant
 
-Prime Radiant is a CLI. Users touch it through `prime-radiant import|stats|find|brief|read|grep|status`, a hub (`hub serve`, reached through `hub connect` over any stdio pipe such as SSH), and a collector (`collect`) that streams session files to the hub. Verification drives the real binary against copies of `tests/fixtures/`, never against the user's live hub.
+Prime Radiant is a CLI. Users touch it through `prime-radiant import|stats|find|brief|read|grep|status|config|skill|doctor`, a hub (`hub serve`, reached through `hub connect` over any stdio pipe such as SSH), and a collector (`collect`) that streams session files to the hub. Verification drives the real binary against copies of `tests/fixtures/`, never against the user's live hub.
 
 Everything goes through `scripts/verify.sh` (run it with bash). Paths below are relative to this skill's folder.
 
@@ -45,6 +45,7 @@ Run it first whenever anything looks off, and drive nothing that fails it.
 | `@SOCK@` | the hub socket |
 | `@SESSIONS@` | the copied fixtures |
 | `@BIN@` | the binary |
+| `@HOME@` | the stand-in home folder, `RUN/home` |
 
 Examples:
 
@@ -55,6 +56,8 @@ TOKEN=$(scripts/verify.sh token)
 scripts/verify.sh append "$RUN" "verification token $TOKEN"
 scripts/verify.sh wait-find "$RUN" "$TOKEN" 30
 ```
+
+`scripts/verify.sh home "$RUN" <label> <prime-radiant args...>` records the call the same way, with `HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, and `XDG_DATA_HOME` in `RUN/home` and `PRIME_RADIANT_HUB` unset. Use it for every call that reads or writes the config file, the skills folders, or the state folder, and for every call with no hub flag, so that the user's own setup never answers or changes.
 
 The hub is its data folder's only writer. To try `import`, give it its own folder, such as `--data @RUN@/local`. Never point `import` at `@DATA@` while the hub runs.
 
@@ -80,5 +83,5 @@ It stops only the hub and collector whose pid files are in `RUN`, and only if th
 
 ## Helpers
 
-- `scripts/verify.sh`: `launch`, `doctor`, `cli`, `collector start|stop|crash`, `hub stop|start`, `big-session`, `token`, `append`, `wait-find`, `cleanup`. Run `scripts/verify.sh` with no arguments for usage.
+- `scripts/verify.sh`: `launch`, `doctor`, `cli`, `home`, `collector start|stop|crash`, `hub stop|start`, `big-session`, `token`, `append`, `wait-find`, `cleanup`. Run `scripts/verify.sh` with no arguments for usage.
 - `eval/`: ground truth and scoring for search quality on the user's own sessions. See `features/search-quality.md`.

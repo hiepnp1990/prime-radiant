@@ -295,13 +295,16 @@ impl Setup {
         }
     }
 
-    /// The stdout of `status` over this test's state folder, with `args`. No variable names a hub.
+    /// The stdout of `status` over this test's state folder, with `args`. No variable, config file, or default data
+    /// folder names a hub.
     fn status(&self, args: &[&str]) -> String {
         let out = self.temp.path().join("status.out");
         let mut child = Command::new(BIN)
             .args(["status", "--state-dir", path(&self.state_dir())])
             .args(args)
             .env_remove("PRIME_RADIANT_HUB")
+            .env_remove("XDG_CONFIG_HOME")
+            .env("HOME", self.temp.path())
             .stdin(Stdio::null())
             .stdout(File::create(&out).expect("status output file is created"))
             .stderr(Stdio::inherit())

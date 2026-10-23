@@ -11,17 +11,19 @@ use prime_radiant::client::{self, HubAddress};
 use prime_radiant::collect::live;
 use prime_radiant::collect::progress::{self, Found, Phase, Snapshot};
 use prime_radiant::collect::{import_claude_code, import_codex, import_grok, import_t3_code};
+use prime_radiant::config::{self, Config, Places};
+use prime_radiant::doctor::{self, Check};
+use prime_radiant::harness::{self, HARNESSES, Harness};
 use prime_radiant::hub;
 use prime_radiant::index::{Indexer, Timestamp};
-use prime_radiant::protocol::{OriginStats, Request, Response};
+use prime_radiant::protocol::{OriginStats, Request};
 use prime_radiant::query::{Answer, Ask, Brief, Filters, Find, Hit, ParentKind, Query, Stats};
 use prime_radiant::raw::{Source, Store};
+use prime_radiant::skill;
 use prime_radiant::transcript::{Matches, Page};
 use serde::Serialize;
 
 const WIDTH: usize = 100;
-/// A hub command for query commands given no `--data`, `--hub-socket`, or `--hub-command`.
-const HUB_ENV: &str = "PRIME_RADIANT_HUB";
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 /// How long `status` waits for the hub, and how often `status --watch` asks it again.
 const HUB_TIMEOUT: Duration = Duration::from_secs(10);
@@ -129,6 +131,10 @@ enum Command {
         command: HubCommand,
     },
     /// Send Claude Code, Codex, Grok, and T3 Code sessions to a hub as they change, and keep running.
+    ///
+    /// With no source flag, it reads every harness this machine has, and says which. With no hub flag, it reaches the
+    /// hub a query command would: PRIME_RADIANT_HUB, then the config file, then the hub socket in the default data
+    /// folder.
     Collect {
         /// The machine or account the files come from.
         #[arg(long)]
@@ -147,8 +153,8 @@ enum Command {
     },
     /// Show what each collector on this machine is doing, and what the hub holds from each origin.
     ///
-    /// It asks the hub that --data, --hub-socket, --hub-command, or PRIME_RADIANT_HUB names, and --data names the hub
-    /// that serves that folder. Without a hub, it shows only the collectors, and why the hub part is missing.
+    /// It asks the hub a query command would, and --data names the hub that serves that folder. Without a hub, it
+    /// shows only the collectors, and why the hub part is missing.
     Status {
         /// The folder of the collectors' state files. Defaults to $XDG_STATE_HOME/prime-radiant, or
         /// ~/.local/state/prime-radiant.
@@ -168,11 +174,33 @@ enum Command {
         #[command(subcommand)]
         command: ServiceCommand,
     },
+    /// Save the hub that commands reach when no flag names one, in a file that every shell reads.
+    ///
+    /// The file is $XDG_CONFIG_HOME/prime-radiant/config.toml, or ~/.config/prime-radiant/config.toml. A command takes
+    /// a hub flag first, then PRIME_RADIANT_HUB, then this file, then the hub socket in ~/.local/share/prime-radiant
+    /// when a hub serves that folder on this machine. A variable exported in ~/.bashrc never reaches a non-interactive
+    /// shell, such as an agent's tool shell, and this file does.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+    /// Install the Prime Radiant skill for each harness, so that its agents know how to find past sessions.
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
+    /// Check this machine's setup: the binary, the hub and the route to it, the harnesses, collectors, services, and
+    /// skill. It changes nothing.
+    ///
+    /// Each line starts with ok, warn, or fail, and the line after a warning or failure gives the next step. It exits
+    /// nonzero if a check fails.
+    Doctor,
 }
 
-/// Where the sessions are. Each flag repeats, and at least one is required.
+/// Where the sessions are. Each flag repeats. With none, `collect` reads every harness this machine has, and `import`
+/// asks for one.
 #[derive(Args)]
-#[group(required = true, multiple = true)]
+#[group(multiple = true)]
 struct Sources {
     /// A Claude Code projects folder, such as ~/.claude/projects.
     #[arg(long = "claude-code")]
@@ -188,8 +216,10 @@ struct Sources {
     t3_code: Vec<PathBuf>,
 }
 
+const SOURCE_FLAGS: &str = "--claude-code, --codex, --grok, or --t3-code";
+
 impl Sources {
-    fn into_list(self) -> Vec<(Source, PathBuf)> {
+    fn named(self) -> Vec<(Source, PathBuf)> {
         let tag = |source, paths: Vec<PathBuf>| paths.into_iter().map(move |path| (source, path));
         tag(Source::ClaudeCode, self.claude_code)
             .chain(tag(Source::Codex, self.codex))
@@ -197,6 +227,55 @@ impl Sources {
             .chain(tag(Source::T3Code, self.t3_code))
             .collect()
     }
+
+    /// The sources the flags name, or with none, every harness this machine has, which it passes to `say`.
+    fn chosen(self, say: impl Fn(&str)) -> prime_radiant::Result<Vec<(Source, PathBuf)>> {
+        let named = self.named();
+        if !named.is_empty() {
+            return Ok(named);
+        }
+        let home = home()?;
+        let detected = harness::detect(&home);
+        if detected.is_empty() {
+            return Err(prime_radiant::Error::Usage(format!(
+                "give {SOURCE_FLAGS}: this machine has no harness at {}",
+                harness::looked_in(&home)
+            )));
+        }
+        let found: Vec<String> = detected
+            .iter()
+            .map(|found| {
+                format!(
+                    "{} at {} ({})",
+                    found.source.as_str(),
+                    found.path.display(),
+                    sessions(&found.sessions)
+                )
+            })
+            .collect();
+        say(&format!(
+            "no source flag, so reading every harness on this machine: {}",
+            found.join(", ")
+        ));
+        Ok(detected
+            .into_iter()
+            .map(|found| (found.source, found.path))
+            .collect())
+    }
+}
+
+fn sessions(count: &prime_radiant::Result<u64>) -> String {
+    match count {
+        Ok(1) => "1 session".to_owned(),
+        Ok(n) => format!("{} sessions", progress::count(*n)),
+        Err(error) => format!("sessions not counted: {error}"),
+    }
+}
+
+fn home() -> prime_radiant::Result<PathBuf> {
+    Places::from_env()
+        .map(|places| places.home)
+        .ok_or_else(|| prime_radiant::Error::Usage("HOME is not an absolute path".to_owned()))
 }
 
 #[derive(Subcommand)]
@@ -213,7 +292,7 @@ enum HubCommand {
     },
 }
 
-/// Where a query is answered: a local data folder, or a hub. With no flag, the hub command in PRIME_RADIANT_HUB.
+/// Where a query is answered: a local data folder, or a hub. With no flag, the route in `config`.
 #[derive(Args)]
 #[group(multiple = false)]
 struct Target {
@@ -254,16 +333,11 @@ impl Target {
                 let flags = format!(" --hub-command {}", quoted(&command));
                 (At::Hub(HubAddress::Command(command)), flags)
             }
-            (None, None, None) => match std::env::var(HUB_ENV) {
-                Ok(command) if !command.trim().is_empty() => {
-                    (At::Hub(HubAddress::Command(command)), String::new())
-                }
-                _ => {
-                    return Err(prime_radiant::Error::Usage(format!(
-                        "give --data, --hub-socket, or --hub-command, or set {HUB_ENV} to a command that reaches the hub"
-                    )));
-                }
-            },
+            // The route comes from the environment or a file, so the next command finds it with no flag either.
+            (None, None, None) => (
+                At::Hub(route("--data, --hub-socket, or --hub-command")?.0),
+                String::new(),
+            ),
         };
         Ok(Answerer { at, flags })
     }
@@ -289,7 +363,7 @@ impl Answerer {
 }
 
 #[derive(Args)]
-#[group(required = true, multiple = false)]
+#[group(multiple = false)]
 struct HubArgs {
     /// The hub's socket on this machine, <data>/hub.sock.
     #[arg(long)]
@@ -300,12 +374,26 @@ struct HubArgs {
 }
 
 impl HubArgs {
-    fn address(self) -> HubAddress {
+    /// The hub the flags name, or the route a query command takes, which it passes to `say` with where it came from.
+    fn address(self, say: impl Fn(&str)) -> prime_radiant::Result<HubAddress> {
         match (self.hub_socket, self.hub_command) {
-            (Some(socket), _) => HubAddress::Socket(socket),
-            (None, Some(command)) => HubAddress::Command(command),
-            (None, None) => unreachable!("clap requires one of the hub flags"),
+            (Some(socket), _) => Ok(HubAddress::Socket(socket)),
+            (None, Some(command)) => Ok(HubAddress::Command(command)),
+            (None, None) => {
+                let (hub, from) = route("--hub-socket or --hub-command")?;
+                say(&format!("no hub flag, so the hub is {hub}, from {from}"));
+                Ok(hub)
+            }
         }
+    }
+}
+
+/// The route a command takes with no hub flag, or the error that lists the `flags` and every other way to name a hub.
+fn route(flags: &str) -> prime_radiant::Result<(HubAddress, config::RouteFrom)> {
+    let places = Places::from_env();
+    match config::hub_route(places.as_ref())? {
+        Some(route) => Ok((route.hub, route.from)),
+        None => Err(config::no_route(places.as_ref(), flags)),
     }
 }
 
@@ -336,6 +424,9 @@ enum InstallService {
         options: InstallOptions,
     },
     /// Run `collect` as a service, with the same source and hub flags.
+    ///
+    /// With no source or hub flag, it finds them as `collect` does and says what it found, and the definition keeps
+    /// them. Install again after a new harness or `config set`.
     Collector {
         /// The machine or account the files come from. It names the service, so it may use only letters, digits, '.', '_', and '-'.
         #[arg(long)]
@@ -407,11 +498,14 @@ impl ServiceCommand {
                         hub,
                         options,
                     },
-            } => options.install(Spec::Collector {
-                origin,
-                sources: sources.into_list(),
-                hub: hub.address(),
-            }),
+            } => {
+                let say = |note: &str| println!("{note}");
+                options.install(Spec::Collector {
+                    origin,
+                    sources: sources.chosen(say)?,
+                    hub: hub.address(say)?,
+                })
+            }
             ServiceCommand::Uninstall {
                 service: UninstallService::Hub { dry_run },
             } => service::uninstall(Kind::Hub, dry_run),
@@ -420,6 +514,219 @@ impl ServiceCommand {
             } => service::uninstall(Kind::Collector(origin), dry_run),
             ServiceCommand::List => service::list(),
         }
+    }
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Save the hub in the config file, in place of the hub it named before.
+    Set {
+        #[command(subcommand)]
+        setting: Setting,
+    },
+    /// Remove a setting from the config file.
+    Unset {
+        #[command(subcommand)]
+        setting: Unset,
+    },
+    /// Print the hub a command reaches with no hub flag, where that comes from, and what the config file names.
+    Show,
+}
+
+#[derive(Subcommand)]
+enum Setting {
+    /// A command whose stdin and stdout reach the hub, given as one quoted argument.
+    HubCommand {
+        /// Such as "ssh <host> prime-radiant hub connect --data <dir>". It runs with `sh -c`, which expands ~ and $HOME.
+        command: String,
+    },
+    /// The hub's socket on this machine, <data>/hub.sock.
+    HubSocket {
+        /// The socket. A relative path is saved as an absolute one.
+        path: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum Unset {
+    /// The hub, a command or a socket.
+    Hub,
+}
+
+impl ConfigCommand {
+    fn run(self) -> prime_radiant::Result<()> {
+        let places = Places::from_env().ok_or_else(|| {
+            prime_radiant::Error::Usage(
+                "HOME is not an absolute path, so there is no place for the config file".to_owned(),
+            )
+        })?;
+        let file = places.config_file.display();
+        match self {
+            ConfigCommand::Set { setting } => {
+                let hub = match setting {
+                    Setting::HubCommand { command } if command.trim().is_empty() => {
+                        return Err(prime_radiant::Error::Usage(
+                            "the hub command is empty".to_owned(),
+                        ));
+                    }
+                    Setting::HubCommand { command } => HubAddress::Command(command),
+                    Setting::HubSocket { path } => {
+                        HubAddress::Socket(match path.strip_prefix("~") {
+                            Ok(rest) => places.home.join(rest),
+                            Err(_) => std::path::absolute(&path)?,
+                        })
+                    }
+                };
+                config::write(
+                    &places,
+                    &Config {
+                        hub: Some(hub.clone()),
+                    },
+                )?;
+                println!("wrote {file}: {hub}");
+                if let HubAddress::Socket(socket) = &hub
+                    && !socket.exists()
+                {
+                    eprintln!("warning: there is no socket at {} yet", socket.display());
+                }
+                if config::environment().is_some() {
+                    eprintln!(
+                        "warning: {} is set in this shell, and it comes before the config file",
+                        config::HUB_ENV
+                    );
+                }
+                if std::env::var_os("XDG_CONFIG_HOME")
+                    .is_some_and(|dir| Path::new(&dir) != places.home.join(".config"))
+                {
+                    eprintln!(
+                        "note: XDG_CONFIG_HOME is set here, and a shell without it reads ~/.config/prime-radiant/config.toml instead"
+                    );
+                }
+                println!("`prime-radiant doctor` checks that the hub answers");
+            }
+            ConfigCommand::Unset {
+                setting: Unset::Hub,
+            } => {
+                let existed = places.config_file.exists();
+                config::write(&places, &Config::default())?;
+                if existed {
+                    println!("removed {file}, which held only the hub");
+                } else {
+                    println!("no config file at {file}");
+                }
+            }
+            ConfigCommand::Show => print!("{}", config_text(&places)),
+        }
+        Ok(())
+    }
+}
+
+/// The route a command takes with no hub flag, where it comes from, and what the config file names.
+fn config_text(places: &Places) -> String {
+    let mut out = match config::hub_route(Some(places)) {
+        Ok(Some(route)) => format!("hub: {}\nfrom: {}\n", route.hub, route.from),
+        Ok(None) => "hub: none, so a command needs a flag that names one\n".to_owned(),
+        Err(error) => format!("hub: none, because {error}\n"),
+    };
+    let file = places.config_file.display();
+    out += &match config::read(places) {
+        Ok(Config { hub: Some(hub) }) => format!("config file: {file}, which names {hub}\n"),
+        Ok(_) if places.config_file.exists() => {
+            format!("config file: {file}, which names no hub\n")
+        }
+        Ok(_) => format!("config file: {file}, which does not exist\n"),
+        Err(_) => format!("config file: {file}, which cannot be read\n"),
+    };
+    out
+}
+
+#[derive(Subcommand)]
+enum SkillCommand {
+    /// Write the skill to <skills folder>/prime-radiant/SKILL.md: ~/.claude/skills, ~/.codex/skills, or ~/.grok/skills.
+    ///
+    /// Without --harness, it installs for every harness this machine has. It replaces only a file it wrote before,
+    /// which it marks with a line after the frontmatter, unless --force is given.
+    Install {
+        #[command(flatten)]
+        options: SkillOptions,
+    },
+    /// Remove the skill that skill install wrote. Without --harness, from every harness that reads skills.
+    Uninstall {
+        #[command(flatten)]
+        options: SkillOptions,
+    },
+}
+
+#[derive(Args)]
+struct SkillOptions {
+    /// A harness to change. Repeat for several.
+    #[arg(long = "harness", value_name = "HARNESS", value_parser = skill_harness())]
+    harnesses: Vec<Source>,
+    /// Replace or remove a skill file that skill install did not write.
+    #[arg(long)]
+    force: bool,
+    /// Print what would change, and change nothing.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+impl SkillCommand {
+    fn run(self) -> prime_radiant::Result<()> {
+        let home = home()?;
+        let (mode, options) = match self {
+            SkillCommand::Install { options } => (skill::Mode::Install, options),
+            SkillCommand::Uninstall { options } => (skill::Mode::Uninstall, options),
+        };
+        let reads_skills = |source: &Source| Harness::of(*source).reads_skills();
+        let harnesses: Vec<Source> = match (mode, options.harnesses.is_empty()) {
+            (_, false) => options.harnesses,
+            (skill::Mode::Install, true) => {
+                let found: Vec<Source> = harness::detect(&home)
+                    .into_iter()
+                    .map(|found| found.source)
+                    .filter(reads_skills)
+                    .collect();
+                if found.is_empty() {
+                    return Err(prime_radiant::Error::Usage(format!(
+                        "give --harness: this machine has no harness that reads skills at {}",
+                        harness::looked_in(&home)
+                    )));
+                }
+                found
+            }
+            (skill::Mode::Uninstall, true) => HARNESSES
+                .iter()
+                .map(|harness| harness.source)
+                .filter(reads_skills)
+                .collect(),
+        };
+        skill::run(mode, &harnesses, &home, options.force, options.dry_run)
+    }
+}
+
+fn skill_harness() -> impl TypedValueParser<Value = Source> {
+    let names = HARNESSES
+        .iter()
+        .filter(|harness| harness.reads_skills())
+        .map(|harness| harness.source.as_str());
+    PossibleValuesParser::new(names)
+        .map(|name| Source::parse(&name).expect("clap allows only harness names"))
+}
+
+fn doctor_command() -> prime_radiant::Result<()> {
+    let mut failed = 0;
+    doctor::run(&mut |check| match check {
+        Check::Ok(what) => println!("ok    {what}"),
+        Check::Warn { what, next } => println!("warn  {what}\n      next: {next}"),
+        Check::Fail { what, next } => {
+            failed += 1;
+            println!("fail  {what}\n      next: {next}");
+        }
+    });
+    match failed {
+        0 => Ok(()),
+        1 => Err(prime_radiant::Error::Usage("1 check failed".to_owned())),
+        n => Err(prime_radiant::Error::Usage(format!("{n} checks failed"))),
     }
 }
 
@@ -439,7 +746,12 @@ fn run(command: Command) -> prime_radiant::Result<()> {
             data,
             origin,
             sources,
-        } => import(&data, &origin, sources.into_list()),
+        } => match sources.named() {
+            sources if sources.is_empty() => {
+                Err(prime_radiant::Error::Usage(format!("give {SOURCE_FLAGS}")))
+            }
+            sources => import(&data, &origin, sources),
+        },
         Command::Stats { target, json } => query(target, Ask::Stats, json),
         Command::Find {
             query: words,
@@ -502,16 +814,24 @@ fn run(command: Command) -> prime_radiant::Result<()> {
             hub,
             sweep_seconds,
             state_file,
-        } => live::run(live::Options {
-            state_file: state_file.or_else(|| {
-                progress::default_dir().map(|dir| dir.join(progress::file_name(&origin)))
-            }),
-            origin,
-            sources: sources.into_list(),
-            hub: hub.address(),
-            sweep: Duration::from_secs(sweep_seconds),
-        }),
+        } => {
+            let say = |note: &str| eprintln!("collect: {note}");
+            let sources = sources.chosen(say)?;
+            let hub = hub.address(say)?;
+            live::run(live::Options {
+                state_file: state_file.or_else(|| {
+                    progress::default_dir().map(|dir| dir.join(progress::file_name(&origin)))
+                }),
+                origin,
+                sources,
+                hub,
+                sweep: Duration::from_secs(sweep_seconds),
+            })
+        }
         Command::Service { command } => command.run(),
+        Command::Config { command } => command.run(),
+        Command::Skill { command } => command.run(),
+        Command::Doctor => doctor_command(),
         Command::Status {
             state_dir,
             target,
@@ -644,22 +964,8 @@ impl HubPoll {
 }
 
 fn ask_origins(hub: &HubAddress) -> HubPart {
-    match client::ask(hub, Request::Origins) {
-        Ok(Response::Origins { origins }) => HubPart::Origins(origins),
-        Ok(other) => HubPart::Unavailable(format!("the hub answered {other:?}")),
-        // A hub answers "bad frame" to a request it cannot decode, which this client sends only to a hub older than
-        // the question.
-        Err(prime_radiant::Error::Usage(message)) if message.starts_with("bad frame") => {
-            HubPart::Unavailable(format!(
-                "the hub does not know this question, so it is older than this client: {message}"
-            ))
-        }
-        Err(prime_radiant::Error::Usage(message)) => {
-            HubPart::Unavailable(format!("the hub could not answer: {message}"))
-        }
-        Err(prime_radiant::Error::Io(error)) => {
-            HubPart::Unavailable(format!("cannot reach the hub: {error}"))
-        }
+    match client::origins(hub) {
+        Ok(origins) => HubPart::Origins(origins),
         Err(error) => HubPart::Unavailable(error.to_string()),
     }
 }

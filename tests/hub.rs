@@ -968,10 +968,12 @@ fn hub_killed_mid_write_restarts_with_nothing_past_the_committed_offsets() {
     let collector = setup.collector("collector", ORIGIN, &root, &setup.bridge_command());
 
     let db = setup.raw_db_when_ready();
-    let deadline = Instant::now() + CONVERGE;
+    // Catching the hub between writing bytes and committing them is a race a fast machine can lose for minutes, so
+    // after a while the test writes the torn tail itself while the hub is down. Either way the restart must trim it.
+    let natural = Instant::now() + Duration::from_secs(20);
+    let mut log = None;
     let mut torn_writes = 0;
-    while torn_writes == 0 {
-        assert!(Instant::now() < deadline, "the hub was caught mid-write");
+    while torn_writes == 0 && Instant::now() < natural {
         let Some((id, generation, offset)) = setup.confirmed(&db, &large) else {
             thread::sleep(Duration::from_millis(1));
             continue;
@@ -981,12 +983,14 @@ fn hub_killed_mid_write_restarts_with_nothing_past_the_committed_offsets() {
             len = grow_transcript(&root.join(&large), LARGE_ID, LARGE_BYTES);
             continue;
         }
-        let log = setup
+        let path = setup
             .data
             .join("streams")
             .join(id.to_string())
             .join(format!("{generation}.log"));
-        if fs::metadata(&log).map_or(0, |meta| meta.len()) <= offset {
+        let written = fs::metadata(&path).map_or(0, |meta| meta.len());
+        log = Some(path);
+        if written <= offset {
             thread::sleep(Duration::from_millis(1));
             continue;
         }
@@ -994,14 +998,51 @@ fn hub_killed_mid_write_restarts_with_nothing_past_the_committed_offsets() {
         collector.signal("STOP");
         hub.kill();
         torn_writes = setup.bytes_past_committed();
-        hub = setup.hub();
-        assert_eq!(
-            setup.bytes_past_committed(),
-            0,
-            "the restarted hub trimmed every byte past the committed offsets"
-        );
-        collector.signal("CONT");
+        if torn_writes == 0 {
+            hub = setup.hub();
+            collector.signal("CONT");
+        }
     }
+    if torn_writes == 0 {
+        let log = log.unwrap_or_else(|| {
+            let deadline = Instant::now() + CONVERGE;
+            loop {
+                if let Some((id, generation, _)) = setup.confirmed(&db, &large) {
+                    break setup
+                        .data
+                        .join("streams")
+                        .join(id.to_string())
+                        .join(format!("{generation}.log"));
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the large stream reached the hub"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        collector.signal("STOP");
+        hub.kill();
+        OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .expect("the stream log opens for append")
+            .write_all(&[b'x'; 4096])
+            .expect("a torn tail is written");
+        torn_writes = setup.bytes_past_committed();
+    }
+    assert!(
+        torn_writes > 0,
+        "the hub's data holds bytes past its committed offsets"
+    );
+    hub = setup.hub();
+    assert_eq!(
+        setup.bytes_past_committed(),
+        0,
+        "the restarted hub trimmed every byte past the committed offsets"
+    );
+    collector.signal("CONT");
+    let _hub = hub;
 
     setup.wait_until_copied(ORIGIN, &root);
     setup.assert_segments_contiguous();

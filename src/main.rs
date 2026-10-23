@@ -134,6 +134,11 @@ enum Command {
         #[arg(long, default_value_t = 300)]
         sweep_seconds: u64,
     },
+    /// Keep the hub or a collector running as this user's service: a systemd user unit on Linux, a launchd agent on macOS.
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
 }
 
 /// Where the sessions are. Each flag repeats, and at least one is required.
@@ -265,6 +270,130 @@ struct HubArgs {
     hub_command: Option<String>,
 }
 
+impl HubArgs {
+    fn address(self) -> HubAddress {
+        match (self.hub_socket, self.hub_command) {
+            (Some(socket), _) => HubAddress::Socket(socket),
+            (None, Some(command)) => HubAddress::Command(command),
+            (None, None) => unreachable!("clap requires one of the hub flags"),
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// Write the service's definition and start it. Installing the same service again replaces its definition.
+    Install {
+        #[command(subcommand)]
+        service: InstallService,
+    },
+    /// Stop a service and remove its definition. Its data and log stay.
+    Uninstall {
+        #[command(subcommand)]
+        service: UninstallService,
+    },
+    /// List this user's Prime Radiant services, whether each is running, and where its log is.
+    List,
+}
+
+#[derive(Subcommand)]
+enum InstallService {
+    /// Run `hub serve` as a service.
+    Hub {
+        /// The data folder to serve. The hub listens on <data>/hub.sock.
+        #[arg(long, default_value = "~/.local/share/prime-radiant")]
+        data: PathBuf,
+        #[command(flatten)]
+        options: InstallOptions,
+    },
+    /// Run `collect` as a service, with the same source and hub flags.
+    Collector {
+        /// The machine or account the files come from. It names the service, so it may use only letters, digits, '.', '_', and '-'.
+        #[arg(long)]
+        origin: prime_radiant::service::Origin,
+        #[command(flatten)]
+        sources: Sources,
+        #[command(flatten)]
+        hub: HubArgs,
+        #[command(flatten)]
+        options: InstallOptions,
+    },
+}
+
+#[derive(Args)]
+struct InstallOptions {
+    /// The most memory the service may use, such as 512M or 2G. Past it, the kernel ends the service and systemd restarts it. launchd has no memory cap.
+    #[arg(long, value_name = "SIZE")]
+    memory_max: Option<prime_radiant::service::MemoryMax>,
+    /// The prime-radiant binary the service runs, such as a path that stays the same across upgrades. The default is this binary.
+    #[arg(long, value_name = "PATH")]
+    binary: Option<PathBuf>,
+    /// Print the file and the commands, and change nothing.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+impl InstallOptions {
+    fn install(self, spec: prime_radiant::service::Spec) -> prime_radiant::Result<()> {
+        prime_radiant::service::install(prime_radiant::service::Install {
+            spec,
+            binary: self.binary,
+            memory_max: self.memory_max,
+            dry_run: self.dry_run,
+        })
+    }
+}
+
+#[derive(Subcommand)]
+enum UninstallService {
+    /// Remove the hub's service.
+    Hub {
+        /// Print the commands, and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove the service of the collector for one origin.
+    Collector {
+        /// The origin the collector was installed with.
+        #[arg(long)]
+        origin: prime_radiant::service::Origin,
+        /// Print the commands, and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+impl ServiceCommand {
+    fn run(self) -> prime_radiant::Result<()> {
+        use prime_radiant::service::{self, Kind, Spec};
+        match self {
+            ServiceCommand::Install {
+                service: InstallService::Hub { data, options },
+            } => options.install(Spec::Hub { data }),
+            ServiceCommand::Install {
+                service:
+                    InstallService::Collector {
+                        origin,
+                        sources,
+                        hub,
+                        options,
+                    },
+            } => options.install(Spec::Collector {
+                origin,
+                sources: sources.into_list(),
+                hub: hub.address(),
+            }),
+            ServiceCommand::Uninstall {
+                service: UninstallService::Hub { dry_run },
+            } => service::uninstall(Kind::Hub, dry_run),
+            ServiceCommand::Uninstall {
+                service: UninstallService::Collector { origin, dry_run },
+            } => service::uninstall(Kind::Collector(origin), dry_run),
+            ServiceCommand::List => service::list(),
+        }
+    }
+}
+
 fn main() -> ExitCode {
     match run(Cli::parse().command) {
         Ok(()) => ExitCode::SUCCESS,
@@ -353,6 +482,7 @@ fn run(command: Command) -> prime_radiant::Result<()> {
             },
             sweep: Duration::from_secs(sweep_seconds),
         }),
+        Command::Service { command } => command.run(),
     }
 }
 

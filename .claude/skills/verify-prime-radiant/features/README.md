@@ -31,4 +31,5 @@ Each feature file starts with an H1 and one paragraph on the user-visible behavi
 - [Read and grep](./read-and-grep.md): pages through a session and finds text inside it.
 - [Live sync](./live-sync.md): the collector streams changes to the hub, survives a crash, and a new line becomes findable.
 - [Remote access](./remote-access.md): the CLI reaches the hub through a stdio bridge such as SSH.
+- [Services](./services.md): `service install`, `uninstall`, and `list` keep the hub and collectors running as login services; a dry run prints the definition and changes nothing.
 - [Search quality](./search-quality.md): measures topic search on the user's own sessions against ground truth from the harnesses' own files.

@@ -6,6 +6,7 @@ pub mod protocol;
 pub mod query;
 pub mod raw;
 pub mod redact;
+pub mod service;
 pub mod transcript;
 
 use std::fmt;

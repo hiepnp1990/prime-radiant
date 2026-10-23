@@ -379,6 +379,24 @@ fn brief_names_a_subagent_or_a_fork_and_the_session_it_belongs_to() {
 }
 
 #[test]
+fn a_session_prefix_may_keep_the_source_it_was_copied_with() {
+    let setup = Setup::new();
+    setup.import();
+
+    assert_eq!(setup.brief("claude-code/33831ab7")["key"], MAIN_KEY);
+    assert_eq!(setup.find_keys("claude-code/33831ab7"), [MAIN_KEY]);
+    let other_source = Command::new(env!("CARGO_BIN_EXE_prime-radiant"))
+        .args(["brief", "codex/33831ab7", "--data", path(&setup.data)])
+        .output()
+        .expect("prime-radiant runs");
+    assert!(
+        !other_source.status.success()
+            && String::from_utf8_lossy(&other_source.stderr).contains("no session matches"),
+        "the source narrows the prefix to that harness"
+    );
+}
+
+#[test]
 fn brief_text_fits_in_100_columns() {
     let setup = Setup::new();
     setup.import();

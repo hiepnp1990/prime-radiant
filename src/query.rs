@@ -434,17 +434,25 @@ impl Query {
         if let Some(key) = exact {
             return Ok(vec![key]);
         }
-        let Some(prefix) = id_prefix(input) else {
+        // `find` prints keys as `<source>/<id>`, so a prefix copied from one keeps its source, which narrows the match.
+        let (source, rest) = match input.split_once('/') {
+            Some((name, rest)) => match Source::parse(name) {
+                Some(source) => (Some(source.as_str()), rest),
+                None => (None, input),
+            },
+            None => (None, input),
+        };
+        let Some(prefix) = id_prefix(rest) else {
             return Ok(Vec::new());
         };
         let mut query = self.db.prepare(
             "SELECT DISTINCT s.key, IIF(s.kind = 'subagent', s.parent_key, NULL)
              FROM aliases a JOIN sessions s ON s.key = a.session_key
-             WHERE substr(a.value, 1, length(?1)) = ?1
+             WHERE substr(a.value, 1, length(?1)) = ?1 AND (?2 IS NULL OR s.source = ?2)
              ORDER BY s.last_activity DESC, s.key",
         )?;
         let matches = query
-            .query_map([&prefix], |row| {
+            .query_map(rusqlite::params![&prefix, source], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
 
 permissions:
@@ -45,3 +46,31 @@ jobs:
           name: ${{ matrix.artifact }}
           path: target/release/prime-radiant
           retention-days: 14
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Name the assets and write SHA256SUMS
+        run: |
+          mkdir assets
+          for asset in prime-radiant-linux-x86_64 prime-radiant-macos-arm64; do
+            install -m 755 "artifacts/$asset/prime-radiant" "assets/$asset"
+          done
+          version=$(assets/prime-radiant-linux-x86_64 --version)
+          test "$version" = "prime-radiant ${GITHUB_REF_NAME#v}" || { echo "::error::tag $GITHUB_REF_NAME does not match $version"; exit 1; }
+          file assets/prime-radiant-macos-arm64 | grep 'Mach-O 64-bit.*arm64'
+          cd assets
+          sha256sum prime-radiant-* > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes assets/*
